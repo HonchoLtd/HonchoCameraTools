@@ -1,11 +1,13 @@
 package app.thehoncho.cameratools
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
@@ -13,6 +15,7 @@ import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.scrollable
@@ -46,9 +49,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.lifecycle.coroutineScope
+import androidx.lifecycle.lifecycleScope
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.WorkRequest
 import app.thehoncho.cameratools.ui.theme.HonchoCameraToolsTheme
+import app.thehoncho.cameratools.worker.CameraWorker
 import app.thehoncho.pronto.Logger
 import app.thehoncho.pronto.PTPUsbConnection
 import app.thehoncho.pronto.Session
@@ -59,9 +68,13 @@ import app.thehoncho.pronto.camera.SonyCamera
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.model.ImageObject
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import java.util.UUID
+import kotlin.coroutines.coroutineContext
 
 class MainActivity : ComponentActivity() {
     private lateinit var permissionIntent: PendingIntent
@@ -73,6 +86,21 @@ class MainActivity : ComponentActivity() {
 
     private val _usbDevice = MutableStateFlow<UsbDevice?>(null)
     private val usbDevice = _usbDevice.asStateFlow()
+
+    private val workerManagerTAG = "CameraService"
+
+    private val requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
+            if (isGranted) {
+                // Permission is granted. Continue the action or workflow in your
+                // app.
+            } else {
+                // Explain to the user that the feature is unavailable because the
+                // feature requires a permission that the user has denied. At the
+                // same time, respect the user's decision. Don't link to system
+                // settings in an effort to convince the user to change their
+                // decision.
+            }
+        }
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(p0: Context, p1: Intent) {
@@ -128,9 +156,34 @@ class MainActivity : ComponentActivity() {
             PendingIntent.FLAG_MUTABLE // Should be FLAG_MUTABLE to let usbManager to update the extra with usbDevice
         )
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+
         val usbDeviceIntent = intent.getParcelableExtraCompact(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
         if (usbDeviceIntent != null) {
             Log.d(TAG, "onCreate: usb device intent is found")
+        }
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            usbDevice.collectLatest {
+                if (it != null) {
+                    val uploadWorkRequest: WorkRequest =
+                        OneTimeWorkRequestBuilder<CameraWorker>()
+                            .addTag(workerManagerTAG)
+                            .build()
+                    WorkManager.getInstance(applicationContext).enqueue(uploadWorkRequest)
+                } else {
+                    WorkManager.getInstance(applicationContext).cancelAllWorkByTag(workerManagerTAG)
+                }
+                Log.d(TAG, "onCreate: usb device is collected $it")
+            }
         }
 
         setContent {
@@ -139,89 +192,89 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    val coroutineScope = rememberCoroutineScope()
+                    // val coroutineScope = rememberCoroutineScope()
                     var uiState by remember { mutableStateOf(State()) }
-                    var sonyImage by remember { mutableStateOf(0) }
-                    val currentUsbDevice by usbDevice.collectAsState()
-                    var worker by remember { mutableStateOf<Worker?>(null) }
+                    // var sonyImage by remember { mutableStateOf(0) }
+                    // val currentUsbDevice by usbDevice.collectAsState()
+                    // var worker by remember { mutableStateOf<Worker?>(null) }
 
-                    LaunchedEffect(currentUsbDevice) {
-                        coroutineScope.launch {
-                            if (currentUsbDevice == null) {
-                                worker?.stop()
-                                worker = null
-                                return@launch
-                            }
-
-                            val ptpUsbConnection = createPTPConnection(currentUsbDevice!!)
-                            val logger = createLogger()
-                            val session = Session(logger)
-                            worker = Worker(ptpUsbConnection, logger).apply {
-                                start()
-                            }
-
-                            when (currentUsbDevice!!.vendorId) {
-                                1193 -> {
-                                    // Canon
-                                    val engine = CanonCamera(session)
-                                    engine.setOnDeviceInfo { deviceInfo ->
-                                        logger.d(TAG, "onDeviceInfo: $deviceInfo")
-                                        uiState = uiState.copy(deviceInfo = deviceInfo)
-                                    }
-                                    engine.setOnImageDownloaded { imageObject ->
-                                        Log.d(TAG, "onImageDownloaded: $imageObject")
-                                        uiState = uiState.copy(lastImage = imageObject.image)
-                                    }
-                                    engine.setOnHandlersFilter { handlers ->
-                                        uiState = uiState.copy(totalImage = handlers.size)
-                                        return@setOnHandlersFilter handlers
-                                            .lastOrNull()?.let { listOf(it) } ?: listOf()
-                                    }
-                                    worker!!.offer(engine)
-                                }
-                                1356 -> {
-                                    // Sony
-                                    val engine = SonyCamera(session)
-                                    sonyImage = 0
-                                    engine.setOnDeviceInfo { deviceInfo ->
-                                        logger.d(TAG, "onDeviceInfo: $deviceInfo")
-                                        uiState = uiState.copy(deviceInfo = deviceInfo)
-                                    }
-                                    engine.setOnImageDownloaded { imageObject ->
-                                        Log.d(TAG, "onImageDownloaded: $imageObject")
-                                        sonyImage += 1
-                                        uiState = uiState.copy(lastImage = imageObject.image, totalImage = sonyImage)
-                                    }
-                                    worker!!.offer(engine)
-                                }
-                                1200 -> {
-                                    // Nikon
-                                    val engine = NikonCamera(session)
-                                    engine.setOnDeviceInfo { deviceInfo ->
-                                        logger.d(TAG, "onDeviceInfo: $deviceInfo")
-                                        uiState = uiState.copy(deviceInfo = deviceInfo)
-                                    }
-                                    engine.setOnImageDownloaded { imageObject ->
-                                        Log.d(TAG, "onImageDownloaded: $imageObject")
-                                        uiState = uiState.copy(lastImage = imageObject.image)
-                                    }
-                                    engine.setOnHandlersFilter { handlers ->
-                                        uiState = uiState.copy(totalImage = handlers.size)
-                                        return@setOnHandlersFilter handlers
-                                            .lastOrNull()?.let { listOf(it) } ?: listOf()
-                                    }
-                                    worker!!.offer(engine)
-                                }
-                                1227 -> {
-                                    // Fuji
-                                    throw IllegalStateException("Fuji not support yet")
-                                }
-                                else -> {
-                                    throw IllegalStateException("Unknown vendor id")
-                                }
-                            }
-                        }
-                    }
+//                    LaunchedEffect(currentUsbDevice) {
+//                        coroutineScope.launch {
+//                            if (currentUsbDevice == null) {
+//                                worker?.stop()
+//                                worker = null
+//                                return@launch
+//                            }
+//
+//                            val ptpUsbConnection = createPTPConnection(currentUsbDevice!!)
+//                            val logger = createLogger()
+//                            val session = Session(logger)
+//                            worker = Worker(ptpUsbConnection, logger).apply {
+//                                start()
+//                            }
+//
+//                            when (currentUsbDevice!!.vendorId) {
+//                                1193 -> {
+//                                    // Canon
+//                                    val engine = CanonCamera(session)
+//                                    engine.setOnDeviceInfo { deviceInfo ->
+//                                        logger.d(TAG, "onDeviceInfo: $deviceInfo")
+//                                        uiState = uiState.copy(deviceInfo = deviceInfo)
+//                                    }
+//                                    engine.setOnImageDownloaded { imageObject ->
+//                                        Log.d(TAG, "onImageDownloaded: $imageObject")
+//                                        uiState = uiState.copy(lastImage = imageObject.image)
+//                                    }
+//                                    engine.setOnHandlersFilter { handlers ->
+//                                        uiState = uiState.copy(totalImage = handlers.size)
+//                                        return@setOnHandlersFilter handlers
+//                                            .lastOrNull()?.let { listOf(it) } ?: listOf()
+//                                    }
+//                                    worker!!.offer(engine)
+//                                }
+//                                1356 -> {
+//                                    // Sony
+//                                    val engine = SonyCamera(session)
+//                                    sonyImage = 0
+//                                    engine.setOnDeviceInfo { deviceInfo ->
+//                                        logger.d(TAG, "onDeviceInfo: $deviceInfo")
+//                                        uiState = uiState.copy(deviceInfo = deviceInfo)
+//                                    }
+//                                    engine.setOnImageDownloaded { imageObject ->
+//                                        Log.d(TAG, "onImageDownloaded: $imageObject")
+//                                        sonyImage += 1
+//                                        uiState = uiState.copy(lastImage = imageObject.image, totalImage = sonyImage)
+//                                    }
+//                                    worker!!.offer(engine)
+//                                }
+//                                1200 -> {
+//                                    // Nikon
+//                                    val engine = NikonCamera(session)
+//                                    engine.setOnDeviceInfo { deviceInfo ->
+//                                        logger.d(TAG, "onDeviceInfo: $deviceInfo")
+//                                        uiState = uiState.copy(deviceInfo = deviceInfo)
+//                                    }
+//                                    engine.setOnImageDownloaded { imageObject ->
+//                                        Log.d(TAG, "onImageDownloaded: $imageObject")
+//                                        uiState = uiState.copy(lastImage = imageObject.image)
+//                                    }
+//                                    engine.setOnHandlersFilter { handlers ->
+//                                        uiState = uiState.copy(totalImage = handlers.size)
+//                                        return@setOnHandlersFilter handlers
+//                                            .lastOrNull()?.let { listOf(it) } ?: listOf()
+//                                    }
+//                                    worker!!.offer(engine)
+//                                }
+//                                1227 -> {
+//                                    // Fuji
+//                                    throw IllegalStateException("Fuji not support yet")
+//                                }
+//                                else -> {
+//                                    throw IllegalStateException("Unknown vendor id")
+//                                }
+//                            }
+//                        }
+//                    }
                     MainScreenContent(uiState)
                 }
             }
