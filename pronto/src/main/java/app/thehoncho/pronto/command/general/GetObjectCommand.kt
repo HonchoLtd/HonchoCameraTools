@@ -13,7 +13,6 @@ class GetObjectCommand(
     private val objectHandler: Int,
     private val sampleSize: Int = 2
 ): Command(session) {
-    private val objectHandle = 0
     private var options: BitmapFactory.Options = BitmapFactory.Options()
     private var content: ImageObject? = null
     private var throwable: Throwable? = null
@@ -36,7 +35,7 @@ class GetObjectCommand(
 
     override fun encodeCommand(byteBuffer: ByteBuffer) {
         try {
-            encodeCommand(byteBuffer, PtpConstants.Operation.GetObject, objectHandle)
+            encodeCommand(byteBuffer, PtpConstants.Operation.GetObject, objectHandler)
         } catch (throwable: Throwable) {
             this.throwable = throwable
         }
