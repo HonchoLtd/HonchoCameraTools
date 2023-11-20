@@ -56,13 +56,15 @@ class SonyCamera(private val session: Session): BaseCamera() {
 
         requestPtpMode(executor)
 
-        val checkStorageID = GetStorageIdsCommand(session)
-        executor.handleCommand(checkStorageID)
-        val storageID = checkStorageID.getResult().getOrNull()
-
-        if (storageID != null) {
-            session.log.d(TAG, "getCommand: checkStorageID $storageID size ${storageID.size}")
-        }
+        // This cause the problem on Sony A7IV
+        // TODO please check this for the Sony A7IV, maybe this cause the problem of the image
+//        val checkStorageID = GetStorageIdsCommand(session)
+//        executor.handleCommand(checkStorageID)
+//        val storageID = checkStorageID.getResult().getOrNull()
+//
+//        if (storageID != null) {
+//            session.log.d(TAG, "getCommand: checkStorageID $storageID size ${storageID.size}")
+//        }
 
         while (executor.isRunning()) {
             val eventCheckCommand = SonyEventCheckCommand(session)
