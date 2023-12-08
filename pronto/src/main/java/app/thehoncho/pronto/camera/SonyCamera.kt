@@ -5,7 +5,6 @@ import app.thehoncho.pronto.WorkerExecutor
 import app.thehoncho.pronto.command.general.GetDeviceInfoCommand
 import app.thehoncho.pronto.command.general.GetObjectCommand
 import app.thehoncho.pronto.command.general.GetObjectInfoCommand
-import app.thehoncho.pronto.command.general.GetStorageIdsCommand
 import app.thehoncho.pronto.command.general.OpenSessionCommand
 import app.thehoncho.pronto.command.sony.SonyEventCheckCommand
 import app.thehoncho.pronto.command.sony.SonyGetSDIOGetExtDeviceInfo
@@ -46,11 +45,11 @@ class SonyCamera(private val session: Session): BaseCamera() {
         val deviceInfo = onConnecting(executor)
         if (deviceInfo == null) {
             session.log.e(TAG, "execute: failed when connecting")
-            listener?.onDeviceFailedToConnect(Throwable("failed when get device info, please check the cable or port"))
-            listener?.onStop()
+            listenerCamera?.onDeviceFailedToConnect(Throwable("failed when get device info, please check the cable or port"))
+            listenerCamera?.onStop()
             return@runBlocking
         }
-        listener?.onDeviceConnected(deviceInfo)
+        listenerCamera?.onDeviceConnected(deviceInfo)
         // onDeviceInfoCallback?.invoke(deviceInfo)
         _deviceInfo = deviceInfo
 
@@ -73,14 +72,14 @@ class SonyCamera(private val session: Session): BaseCamera() {
 //            session.log.d(TAG, "getCommand: checkStorageID $storageID size ${storageID.size}")
 //        }
 
-        listener?.onReady()
+        listenerCamera?.onReady()
         while (executor.isRunning()) {
             val eventCheckCommand = SonyEventCheckCommand(session)
             executor.handleCommand(eventCheckCommand)
             eventCheckCommand.getResult().onFailure {
                 session.log.w(TAG, "execute: failed when get event check")
-                listener?.onError(Throwable("failed when get event check, please restart the camera"))
-                listener?.onStop()
+                listenerCamera?.onError(Throwable("failed when get event check, please restart the camera"))
+                listenerCamera?.onStop()
                 return@runBlocking
             }
             val eventCheckContent = eventCheckCommand.getResult().getOrNull() ?: listOf()
@@ -88,12 +87,14 @@ class SonyCamera(private val session: Session): BaseCamera() {
             if (checkInMemoryImage(eventCheckContent, deviceInfo)) {
                 val objectImage = onDownloadImage(executor, globalHandlerID)
                 if (objectImage == null) {
-                    session.log.e(TAG, "getCommand: failed when download image")
-                    listener?.onError(Throwable("failed when download image"))
-                    listener?.onStop()
-                    return@runBlocking
+                    if (deviceInfo.model != "ILCE-7M4") {
+                        session.log.e(TAG, "getCommand: failed when download image")
+                        listenerCamera?.onError(Throwable("failed when download image"))
+                        listenerCamera?.onStop()
+                        return@runBlocking
+                    }
                 }
-                objectImage.let { listener?.onImageDownloaded(it) }
+                objectImage?.let { listenerCamera?.onImageDownloaded(it) }
                 session.log.d(TAG, "getCommand: finish download image")
             }
 
@@ -112,7 +113,7 @@ class SonyCamera(private val session: Session): BaseCamera() {
                 }
             }
         }
-        listener?.onStop()
+        listenerCamera?.onStop()
     }
 
     private fun fetchEvent(worker: WorkerExecutor): ByteBuffer? {

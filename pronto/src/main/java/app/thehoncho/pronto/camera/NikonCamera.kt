@@ -30,11 +30,11 @@ class NikonCamera(
         val deviceInfo = onConnecting(executor)
         if (deviceInfo == null) {
             session.log.e(TAG, "execute: failed when connecting")
-            listener?.onDeviceFailedToConnect(Throwable("failed when get device info, please check the cable or port"))
-            listener?.onStop()
+            listenerCamera?.onDeviceFailedToConnect(Throwable("failed when get device info, please check the cable or port"))
+            listenerCamera?.onStop()
             return@runBlocking
         }
-        listener?.onDeviceConnected(deviceInfo)
+        listenerCamera?.onDeviceConnected(deviceInfo)
         // onDeviceInfoCallback?.invoke(deviceInfo)
 
         deviceInfo.operationsSupported.forEach { opt ->
@@ -48,20 +48,20 @@ class NikonCamera(
         executor.handleCommand(getStorageIds)
         getStorageIds.getResult().onFailure {
             session.log.e(TAG, "execute: failed when get storage ids, maybe storage empty")
-            listener?.onError(Throwable("failed when get storage ids, please check the sd card"))
-            listener?.onStop()
+            listenerCamera?.onError(Throwable("failed when get storage ids, please check the sd card"))
+            listenerCamera?.onStop()
             return@runBlocking
         }
         val storageIds = getStorageIds.getResult().getOrNull() ?: return@runBlocking
 
         if (storageIds.isEmpty()) {
             session.log.e(TAG, "execute: storageIds is empty")
-            listener?.onError(Throwable("storage ids is empty, please check the sd card"))
-            listener?.onStop()
+            listenerCamera?.onError(Throwable("storage ids is empty, please check the sd card"))
+            listenerCamera?.onStop()
             return@runBlocking
         }
 
-        listener?.onReady()
+        listenerCamera?.onReady()
         while (executor.isRunning()) {
             session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
             storageIds.forEach { storage ->
@@ -82,8 +82,8 @@ class NikonCamera(
                     executor.handleCommand(getObjectInfo)
                     getObjectInfo.getResult().onFailure {
                         session.log.e(TAG, "execute: failed when get object info, please restart the camera")
-                        listener?.onError(Throwable("failed when get object info $handler, please restart the camera"))
-                        listener?.onStop()
+                        listenerCamera?.onError(Throwable("failed when get object info $handler, please restart the camera"))
+                        listenerCamera?.onStop()
                         return@runBlocking
                     }
                     getObjectInfo.getResult().getOrNull()?.let { cacheImage[handler] = it }
@@ -91,21 +91,21 @@ class NikonCamera(
             }
 
             // val getCleanHandlers = onHandlersFilterCallback?.invoke(cacheImage.values.toList()) ?: listOf()
-            val getCleanHandlers = listener?.onHandlersFilter(cacheImage.values.toList()) ?: listOf()
+            val getCleanHandlers = listenerCamera?.onHandlersFilter(cacheImage.values.toList()) ?: listOf()
             session.log.d(TAG, "execute: get handlers with total ${getCleanHandlers.size} handlers clean")
 
             getCleanHandlers.forEach { handler ->
                 val objectImage = onDownloadImage(executor, handler.handlerID)
                 if (objectImage == null) {
                     session.log.e(TAG, "execute: failed when download image $handler")
-                    listener?.onError(Throwable("failed when download image $handler, please restart the camera"))
-                    listener?.onStop()
+                    listenerCamera?.onError(Throwable("failed when download image $handler, please restart the camera"))
+                    listenerCamera?.onStop()
                     return@runBlocking
                 }
-                objectImage.let { image -> listener?.onImageDownloaded(image) }
+                objectImage.let { image -> listenerCamera?.onImageDownloaded(image) }
             }
         }
-        listener?.onStop()
+        listenerCamera?.onStop()
     }
 
     private fun onConnecting(worker: WorkerExecutor): DeviceInfo? {

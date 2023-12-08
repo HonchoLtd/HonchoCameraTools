@@ -4,7 +4,6 @@ import app.thehoncho.pronto.command.MultipleCommand
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.model.ObjectImage
 import app.thehoncho.pronto.model.ObjectInfo
-import java.lang.Exception
 
 abstract class BaseCamera: MultipleCommand() {
     // This only called with Canon and Nikon so make sure filter with correctly
@@ -12,9 +11,9 @@ abstract class BaseCamera: MultipleCommand() {
     protected var onHandlersFilterCallback: (suspend (handlers: List<ObjectInfo>)->List<ObjectInfo>)? = null
     protected var onImageDownloadedCallback: (suspend (objectImage: ObjectImage)->Unit)? = null
     protected var onDeviceInfoCallback: (suspend (deviceInfo: DeviceInfo)->Unit)? = null
-    protected var listener: Listener? = null
+    protected var listenerCamera: ListenerCamera? = null
 
-    interface Listener {
+    interface ListenerCamera {
         // This call when the camera info already get it,
         // so its mean the command already send to the camera
         suspend fun onDeviceConnected(deviceInfo: DeviceInfo)
@@ -38,12 +37,12 @@ abstract class BaseCamera: MultipleCommand() {
         suspend fun onError(exception: Throwable)
     }
 
-    fun setListener(listener: Listener) {
-        this.listener = listener
+    fun setListener(listenerCamera: ListenerCamera) {
+        this.listenerCamera = listenerCamera
     }
 
     fun clearListener() {
-        this.listener = null
+        this.listenerCamera = null
     }
 
     @Deprecated(
