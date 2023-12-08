@@ -44,7 +44,14 @@ class SonyCamera(private val session: Session): BaseCamera() {
 
     override fun execute(executor: WorkerExecutor) = runBlocking {
         val deviceInfo = onConnecting(executor)
-        onDeviceInfoCallback?.invoke(deviceInfo)
+        if (deviceInfo == null) {
+            session.log.e(TAG, "execute: failed when connecting")
+            listener?.onDeviceFailedToConnect(Throwable("failed when get device info, please check the cable or port"))
+            listener?.onStop()
+            return@runBlocking
+        }
+        listener?.onDeviceConnected(deviceInfo)
+        // onDeviceInfoCallback?.invoke(deviceInfo)
         _deviceInfo = deviceInfo
 
         deviceInfo.operationsSupported.forEach { opt ->
@@ -66,14 +73,27 @@ class SonyCamera(private val session: Session): BaseCamera() {
 //            session.log.d(TAG, "getCommand: checkStorageID $storageID size ${storageID.size}")
 //        }
 
+        listener?.onReady()
         while (executor.isRunning()) {
             val eventCheckCommand = SonyEventCheckCommand(session)
             executor.handleCommand(eventCheckCommand)
+            eventCheckCommand.getResult().onFailure {
+                session.log.w(TAG, "execute: failed when get event check")
+                listener?.onError(Throwable("failed when get event check"))
+                listener?.onStop()
+                return@runBlocking
+            }
             val eventCheckContent = eventCheckCommand.getResult().getOrNull() ?: listOf()
 
             if (checkInMemoryImage(eventCheckContent, deviceInfo)) {
                 val objectImage = onDownloadImage(executor, globalHandlerID)
-                objectImage?.let { onImageDownloadedCallback?.invoke(it) }
+                if (objectImage == null) {
+                    session.log.e(TAG, "getCommand: failed when download image")
+                    listener?.onError(Throwable("failed when download image"))
+                    listener?.onStop()
+                    return@runBlocking
+                }
+                objectImage.let { listener?.onImageDownloaded(it) }
                 session.log.d(TAG, "getCommand: finish download image")
             }
 
@@ -82,7 +102,7 @@ class SonyCamera(private val session: Session): BaseCamera() {
                 val handlerID = getHandlerObjectAdded(event)
                 if (handlerID != null) {
                     globalHandlerID = handlerID
-                    session.log.d(TAG, "getCommand: handlerID $handlerID")
+                    session.log.d(TAG, "setGlobalHandler: handlerID $handlerID")
 //                    if (eventCheckCommand.content.isEmpty()) {
 //                        FirebaseCrashlytics.getInstance().log("getCommand: empty event check so we trigger with event object added")
 //                        val objectImage = onDownloadImage(worker, handlerID) // -16383
@@ -92,6 +112,7 @@ class SonyCamera(private val session: Session): BaseCamera() {
                 }
             }
         }
+        listener?.onStop()
     }
 
     private fun fetchEvent(worker: WorkerExecutor): ByteBuffer? {
@@ -182,14 +203,14 @@ class SonyCamera(private val session: Session): BaseCamera() {
         return isImagePending
     }
 
-    private fun onConnecting(worker: WorkerExecutor): DeviceInfo {
+    private fun onConnecting(worker: WorkerExecutor): DeviceInfo? {
         val openSessionCommand = OpenSessionCommand(session)
         worker.handleCommand(openSessionCommand)
 
         val getDeviceInfoCommand = GetDeviceInfoCommand(session)
         worker.handleCommand(getDeviceInfoCommand)
 
-        return getDeviceInfoCommand.getResult().getOrThrow()
+        return getDeviceInfoCommand.getResult().getOrNull()
     }
 
     private fun requestPtpMode(worker: WorkerExecutor) {

@@ -28,7 +28,14 @@ class NikonCamera(
 
     override fun execute(executor: WorkerExecutor) = runBlocking {
         val deviceInfo = onConnecting(executor)
-        onDeviceInfoCallback?.invoke(deviceInfo)
+        if (deviceInfo == null) {
+            session.log.e(TAG, "execute: failed when connecting")
+            listener?.onDeviceFailedToConnect(Throwable("failed when get device info, please check the cable or port"))
+            listener?.onStop()
+            return@runBlocking
+        }
+        listener?.onDeviceConnected(deviceInfo)
+        // onDeviceInfoCallback?.invoke(deviceInfo)
 
         deviceInfo.operationsSupported.forEach { opt ->
             if (opt.toShort() == PtpConstants.Operation.GetPartialObject) {
@@ -39,19 +46,32 @@ class NikonCamera(
 
         val getStorageIds = GetStorageIdsCommand(session)
         executor.handleCommand(getStorageIds)
-        val storageIds = getStorageIds.getResult().getOrNull() ?: IntArray(0)
+        getStorageIds.getResult().onFailure {
+            session.log.e(TAG, "execute: failed when get storage ids, maybe storage empty")
+            listener?.onError(Throwable("failed when get storage ids, please check the sd card"))
+            listener?.onStop()
+            return@runBlocking
+        }
+        val storageIds = getStorageIds.getResult().getOrNull() ?: return@runBlocking
 
         if (storageIds.isEmpty()) {
             session.log.e(TAG, "execute: storageIds is empty")
+            listener?.onError(Throwable("storage ids is empty, please check the sd card"))
+            listener?.onStop()
             return@runBlocking
         }
 
+        listener?.onReady()
         while (executor.isRunning()) {
             session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
             storageIds.forEach { storage ->
                 session.log.d(TAG, "execute: get handlers with storage $storage")
                 val getHandlersCommand = GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
                 executor.handleCommand(getHandlersCommand)
+                getHandlersCommand.getResult().onFailure {
+                    session.log.w(TAG, "execute: failed when get handlers, maybe the handler its empty")
+                }
+
                 val handlers = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
                 session.log.d(TAG, "execute: get handlers with total ${handlers.size} handlers on storage $storage")
 
@@ -60,21 +80,35 @@ class NikonCamera(
                 handlerNotCache.forEach { handler ->
                     val getObjectInfo = GetObjectInfoCommand(session, handler)
                     executor.handleCommand(getObjectInfo)
-                    getObjectInfo.getResult().getOrNull()?.let { cacheImage[handler] = it  }
+                    getObjectInfo.getResult().onFailure {
+                        session.log.e(TAG, "execute: failed when get object info, please restart the camera")
+                        listener?.onError(Throwable("failed when get object info $handler, please restart the camera"))
+                        listener?.onStop()
+                        return@runBlocking
+                    }
+                    getObjectInfo.getResult().getOrNull()?.let { cacheImage[handler] = it }
                 }
             }
 
-            val getCleanHandlers = onHandlersFilterCallback?.invoke(cacheImage.values.toList()) ?: listOf()
+            // val getCleanHandlers = onHandlersFilterCallback?.invoke(cacheImage.values.toList()) ?: listOf()
+            val getCleanHandlers = listener?.onHandlersFilter(cacheImage.values.toList()) ?: listOf()
             session.log.d(TAG, "execute: get handlers with total ${getCleanHandlers.size} handlers clean")
 
             getCleanHandlers.forEach { handler ->
                 val objectImage = onDownloadImage(executor, handler.handlerID)
-                objectImage?.let { image -> onImageDownloadedCallback?.invoke(image) }
+                if (objectImage == null) {
+                    session.log.e(TAG, "execute: failed when download image $handler")
+                    listener?.onError(Throwable("failed when download image $handler, please restart the camera"))
+                    listener?.onStop()
+                    return@runBlocking
+                }
+                objectImage.let { image -> listener?.onImageDownloaded(image) }
             }
         }
+        listener?.onStop()
     }
 
-    private fun onConnecting(worker: WorkerExecutor): DeviceInfo {
+    private fun onConnecting(worker: WorkerExecutor): DeviceInfo? {
         val openSessionCommand = OpenSessionCommand(session)
         worker.handleCommand(openSessionCommand)
 
@@ -84,12 +118,19 @@ class NikonCamera(
         val eosRequestPCModeCommand = EOSRequestPCModeCommand(session)
         worker.handleCommand(eosRequestPCModeCommand)
 
-        return getDeviceInfoCommand.getResult().getOrThrow()
+        getDeviceInfoCommand.getResult().onFailure {
+            session.log.e(TAG, "onConnecting: failed when get device info")
+        }
+
+        return getDeviceInfoCommand.getResult().getOrNull()
     }
 
     private fun onDownloadImage(worker: WorkerExecutor, handler: Int): ObjectImage? {
         val getObjectInfoCommand = GetObjectInfoCommand(session, handler)
         worker.handleCommand(getObjectInfoCommand)
+        getObjectInfoCommand.getResult().onFailure {
+            session.log.w(TAG, "onDownloadImage: failed when download info image $handler")
+        }
         val objectInfo = getObjectInfoCommand.getResult().getOrNull()
 
         if (objectInfo == null) {
@@ -105,9 +146,12 @@ class NikonCamera(
     }
 
     private fun downloadImage(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
-        session.log.d(TAG, "downloadImage: start download image")
+        session.log.d(TAG, "downloadImage: start download image $handler")
         val getObjectCommand = GetObjectCommand(session, handler)
         worker.handleCommand(getObjectCommand)
+        getObjectCommand.getResult().onFailure {
+            session.log.w(TAG, "downloadImage: failed when download image data $handler")
+        }
         val imageObject = getObjectCommand.getResult().getOrNull()
 
         if (imageObject == null) {
@@ -120,7 +164,7 @@ class NikonCamera(
     }
 
     private fun downloadImagePartial(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
-        session.log.d(TAG, "downloadImagePartial: start download image")
+        session.log.d(TAG, "downloadImagePartial: start download image $handler")
         var offset = 0
         val totalBytes = objectInfo.objectCompressedSize
         val imageTotalBytes = ByteBuffer.allocate(totalBytes)
@@ -138,6 +182,9 @@ class NikonCamera(
             val partialObjectCommand = GetObjectPartial(session, handler, finalOffset, finalSize)
             session.log.d(TAG, "downloadImagePartial: consume command")
             worker.handleCommand(partialObjectCommand)
+            partialObjectCommand.getResult().onFailure {
+                session.log.w(TAG, "downloadImagePartial: failed when download partial image $handler")
+            }
             session.log.d(TAG, "downloadImagePartial: consume command done")
 
             if (partialObjectCommand.getResult().getOrNull() == null) {
