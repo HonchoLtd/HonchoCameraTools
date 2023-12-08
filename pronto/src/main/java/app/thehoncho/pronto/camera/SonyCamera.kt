@@ -79,7 +79,7 @@ class SonyCamera(private val session: Session): BaseCamera() {
             executor.handleCommand(eventCheckCommand)
             eventCheckCommand.getResult().onFailure {
                 session.log.w(TAG, "execute: failed when get event check")
-                listener?.onError(Throwable("failed when get event check"))
+                listener?.onError(Throwable("failed when get event check, please restart the camera"))
                 listener?.onStop()
                 return@runBlocking
             }
