@@ -102,7 +102,7 @@ class CanonCamera(
                     listenerCamera?.onStop()
                     return@runBlocking
                 }
-                objectImage.let { image -> onImageDownloadedCallback?.invoke(image) }
+                objectImage.let { image -> listenerCamera?.onImageDownloaded(image) }
             }
         }
         listenerCamera?.onStop()

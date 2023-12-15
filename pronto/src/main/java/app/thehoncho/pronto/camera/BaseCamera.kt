@@ -8,8 +8,29 @@ import app.thehoncho.pronto.model.ObjectInfo
 abstract class BaseCamera: MultipleCommand() {
     // This only called with Canon and Nikon so make sure filter with correctly
     // the list that return from this function will be download the image and call onImageDownloaded
+    @Deprecated(
+        "Use setListener instead",
+        ReplaceWith(
+            "setListener(listener)",
+            "app.thehoncho.pronto.camera.BaseCamera"
+        )
+    )
     protected var onHandlersFilterCallback: (suspend (handlers: List<ObjectInfo>)->List<ObjectInfo>)? = null
+    @Deprecated(
+        "Use setListener instead",
+        ReplaceWith(
+            "clearListener()",
+            "app.thehoncho.pronto.camera.BaseCamera"
+        )
+    )
     protected var onImageDownloadedCallback: (suspend (objectImage: ObjectImage)->Unit)? = null
+    @Deprecated(
+        "Use setListener instead",
+        ReplaceWith(
+            "setListener(listener)",
+            "app.thehoncho.pronto.camera.BaseCamera"
+        )
+    )
     protected var onDeviceInfoCallback: (suspend (deviceInfo: DeviceInfo)->Unit)? = null
     protected var listenerCamera: ListenerCamera? = null
 
