@@ -11,7 +11,6 @@ import android.content.pm.ServiceInfo
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
@@ -20,9 +19,6 @@ import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
-import app.thehoncho.cameratools.MainActivity
-import app.thehoncho.cameratools.R
-import app.thehoncho.cameratools.getParcelableExtraCompact
 import app.thehoncho.cameratools.utils.createLoggerDefault
 import app.thehoncho.pronto.PTPUsbConnection
 import app.thehoncho.pronto.Session
@@ -244,7 +240,7 @@ class CameraWorker(
                 }
             }
 
-            while (worker!!.isRunning()) {
+            while (worker!!.isRunningProcess) {
                 delay(1000)
             }
 
@@ -320,7 +316,6 @@ class CameraWorker(
             worker?.stop()
             // worker = null
         }
-        Log.d(TAG, "stopProcess: stop the process")
         // createNormalNotificationDisconnected()
         // setForegroundAsync(deviceDisconnectedForegroundInfo())
     }

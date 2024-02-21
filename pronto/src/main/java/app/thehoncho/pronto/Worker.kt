@@ -45,7 +45,8 @@ class Worker(
     private val fullInSize = 0x4000
     private var fullIn: ByteBuffer? = null
 
-    private var isRunning: Boolean = false
+    var isRunningProcess: Boolean = false
+        private set
 
     private val queue: LinkedBlockingQueue<PTPAction> = LinkedBlockingQueue<PTPAction>()
 
@@ -55,7 +56,7 @@ class Worker(
 
     fun start() {
         launch {
-            isRunning = true
+            isRunningProcess = true
             usbRequest1?.close()
             usbRequest2?.close()
             usbRequest3?.close()
@@ -99,7 +100,7 @@ class Worker(
             } catch (e: Exception) {
                 logger.e(TAG, e.message ?: "Unknown error")
             } finally {
-                isRunning = false
+                isRunningProcess = false
                 usbRequest1?.close()
                 usbRequest2?.close()
                 usbRequest3?.close()
@@ -242,7 +243,7 @@ class Worker(
     }
 
     override fun isRunning(): Boolean {
-        return isActive && isRunning
+        return isActive && isRunningProcess
     }
 
     override fun getConnection(): PTPUsbConnection {
@@ -389,7 +390,7 @@ class Worker(
     }
 
     fun stop() {
-        isRunning = false
+        isRunningProcess = false
         cancel()
     }
 
