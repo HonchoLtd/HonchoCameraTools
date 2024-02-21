@@ -156,10 +156,10 @@ object PtpConstants {
         const val NikonChangeCameraMode = 0x90C2
         const val NikonDeleteImagesInSdram = 0x90C3
         const val NikonGetLargeThumb = 0x90C4
-        const val NikonGetEvent = 0x90C7
+        const val NikonGetEvent: Int = 0x90C7
         const val NikonDeviceReady = 0x90C8
         const val NikonSetPreWbData = 0x90C9
-        const val NikonGetVendorPropCodes = 0x90CA
+        const val NikonGetVendorPropCodes: Int = 0x90CA
         const val NikonAfAndCaptureInSdram = 0x90CB
         const val NikonGetPicCtrlData = 0x90CC
         const val NikonSetPicCtrlData = 0x90CD
