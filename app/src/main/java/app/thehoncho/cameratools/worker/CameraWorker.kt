@@ -27,9 +27,13 @@ import app.thehoncho.cameratools.utils.createLoggerDefault
 import app.thehoncho.pronto.PTPUsbConnection
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.Worker
+import app.thehoncho.pronto.camera.BaseCamera
 import app.thehoncho.pronto.camera.CanonCamera
 import app.thehoncho.pronto.camera.NikonCamera
 import app.thehoncho.pronto.camera.SonyCamera
+import app.thehoncho.pronto.model.DeviceInfo
+import app.thehoncho.pronto.model.ObjectImage
+import app.thehoncho.pronto.model.ObjectInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 
@@ -105,55 +109,126 @@ class CameraWorker(
                 1193 -> {
                     // Canon
                     val engine = CanonCamera(session)
-                    engine.setOnDeviceInfo { deviceInfo ->
-                        logger.d(TAG, "onDeviceInfo: $deviceInfo")
-                        // uiState = uiState.copy(deviceInfo = deviceInfo)
-                    }
-                    engine.setOnImageDownloaded { imageObject ->
-                        logger.d(TAG, "onImageDownloaded: $imageObject")
-                        // uiState = uiState.copy(lastImage = imageObject.image)
-                    }
-                    engine.setOnHandlersFilter { handlers ->
-                        logger.d(TAG, "onHandlersFilter: ${handlers.size}")
-                        // uiState = uiState.copy(totalImage = handlers.size)
+                    engine.setListener(object : BaseCamera.ListenerCamera {
+                        override suspend fun onDeviceConnected(deviceInfo: DeviceInfo) {
+                            logger.d(TAG, "onDeviceInfo: ${deviceInfo}")
+                        }
 
-                        return@setOnHandlersFilter handlers
-                            .lastOrNull()?.let { listOf(it) } ?: listOf()
-                    }
+                        override suspend fun onDeviceFailedToConnect(exception: Throwable) {
+                            stopProcess()
+                            // no need to force close, cause it will be trigger onStop after this
+                        }
+
+                        override suspend fun onError(exception: Throwable) {
+                            stopProcess()
+                            // no need to force close, cause it will be trigger onStop after this
+                        }
+
+                        override suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo> {
+                            logger.d(TAG, "onHandlersFilter: ${handlers.size}")
+                            return handlers.lastOrNull()?.let { listOf(it) } ?: listOf()
+                        }
+
+                        override suspend fun onImageDownloaded(objectImage: ObjectImage) {
+                            logger.d(TAG, "onImageDownloaded: ${objectImage.objectInfo.filename}")
+                        }
+
+                        override suspend fun onReady() {
+
+                        }
+
+                        override suspend fun onStop() {
+                            // to make worker force stop and catch by worker
+                            // throw Throwable("Camera stop")
+                        }
+
+                    })
+//                    engine.setOnDeviceInfo(this::onDeviceInfo)
+//                    engine.setOnImageDownloaded(this::onImageDownloaded)
+//                    engine.setOnHandlersFilter(this::onHandlerFilter)
                     worker!!.offer(engine)
                 }
                 1356 -> {
                     // Sony
                     val engine = SonyCamera(session)
-                    sonyImage = 0
-                    engine.setOnDeviceInfo { deviceInfo ->
-                        logger.d(TAG, "onDeviceInfo: $deviceInfo")
-                        // uiState = uiState.copy(deviceInfo = deviceInfo)
-                    }
-                    engine.setOnImageDownloaded { imageObject ->
-                        logger.d(TAG, "onImageDownloaded: $imageObject")
-                        sonyImage += 1
-                        // uiState = uiState.copy(lastImage = imageObject.image, totalImage = sonyImage)
-                    }
+                    engine.setListener(object: BaseCamera.ListenerCamera {
+                        override suspend fun onDeviceConnected(deviceInfo: DeviceInfo) {
+                            logger.d(TAG, "onDeviceInfo: ${deviceInfo}")
+                        }
+
+                        override suspend fun onDeviceFailedToConnect(exception: Throwable) {
+                            stopProcess()
+                            // no need to force close, cause it will be trigger onStop after this
+                        }
+
+                        override suspend fun onError(exception: Throwable) {
+                            stopProcess()
+                            // no need to force close, cause it will be trigger onStop after this
+                        }
+
+                        override suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo> {
+                            // Sony never use this
+                            return emptyList()
+                        }
+
+                        override suspend fun onImageDownloaded(objectImage: ObjectImage) {
+                            logger.d(TAG, "onImageDownloaded: ${objectImage.objectInfo.filename}")
+                        }
+
+                        override suspend fun onReady() {
+
+                        }
+
+                        override suspend fun onStop() {
+                            // to make worker force stop and catch by worker
+                            // throw Throwable("Camera stop")
+                        }
+
+                    })
+//                    engine.setOnDeviceInfo(this::onDeviceInfo)
+//                    engine.setOnImageDownloaded(this::onImageDownloaded)
                     worker!!.offer(engine)
                 }
                 1200 -> {
                     // Nikon
                     val engine = NikonCamera(session)
-                    engine.setOnDeviceInfo { deviceInfo ->
-                        logger.d(TAG, "onDeviceInfo: $deviceInfo")
-                        // uiState = uiState.copy(deviceInfo = deviceInfo)
-                    }
-                    engine.setOnImageDownloaded { imageObject ->
-                        logger.d(TAG, "onImageDownloaded: $imageObject")
-                        // uiState = uiState.copy(lastImage = imageObject.image)
-                    }
-                    engine.setOnHandlersFilter { handlers ->
-                        logger.d(TAG, "onHandlersFilter: ${handlers.size}")
-                        // uiState = uiState.copy(totalImage = handlers.size)
-                        return@setOnHandlersFilter handlers
-                            .lastOrNull()?.let { listOf(it) } ?: listOf()
-                    }
+                    engine.setListener(object : BaseCamera.ListenerCamera {
+                        override suspend fun onDeviceConnected(deviceInfo: DeviceInfo) {
+                            logger.d(TAG, "onDeviceInfo: ${deviceInfo}")
+                        }
+
+                        override suspend fun onDeviceFailedToConnect(exception: Throwable) {
+                            stopProcess()
+                            // no need to force close, cause it will be trigger onStop after this
+                        }
+
+                        override suspend fun onError(exception: Throwable) {
+                            stopProcess()
+                            // no need to force close, cause it will be trigger onStop after this
+                        }
+
+                        override suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo> {
+                            logger.d(TAG, "onHandlersFilter: ${handlers.size}")
+                            return handlers.lastOrNull()?.let { listOf(it) } ?: listOf()
+                        }
+
+                        override suspend fun onImageDownloaded(objectImage: ObjectImage) {
+                            logger.d(TAG, "onImageDownloaded: ${objectImage.objectInfo.filename}")
+                        }
+
+                        override suspend fun onReady() {
+
+                        }
+
+                        override suspend fun onStop() {
+                            // to make worker force stop and catch by worker
+                            // throw Throwable("Camera stop")
+                        }
+
+                    })
+//                    engine.setOnDeviceInfo(this::onDeviceInfo)
+//                    engine.setOnImageDownloaded(this::onImageDownloaded)
+//                    engine.setOnHandlersFilter(this::onHandlerFilter)
                     worker!!.offer(engine)
                 }
                 1227 -> {
@@ -235,6 +310,19 @@ class CameraWorker(
             logger.w(TAG, "ForegroundInfo: launch without service type")
             ForegroundInfo(250295, notification)
         }
+    }
+    
+    private fun stopProcess() {
+        runCatching {
+            //jobDeviceInfo.cancel()
+            //jobEventID.cancel()
+            //jobUploadImage.cancel()
+            worker?.stop()
+            // worker = null
+        }
+        Log.d(TAG, "stopProcess: stop the process")
+        // createNormalNotificationDisconnected()
+        // setForegroundAsync(deviceDisconnectedForegroundInfo())
     }
 
     companion object {
