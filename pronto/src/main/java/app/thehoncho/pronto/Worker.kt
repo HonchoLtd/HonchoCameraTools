@@ -129,8 +129,8 @@ class Worker(
             stop()
             return
         }
-        logger.d(TAG, "Sending packet done with data ")
-        logger.d(TAG, PacketUtil.hexDumpToString(b.array(), 0, res))
+        logger.d(TAG, "Sending packet done with data size $res")
+        Log.d(TAG, PacketUtil.hexDumpToString(b.array(), 0, res))
 
         logger.d(TAG, "Reading packet")
         while (!command.hasResponseReceived) {
@@ -373,7 +373,7 @@ class Worker(
         }
         destination.position(0)
         if (totalBytes > 5 * read) {
-            logger.d(
+            Log.d(
                 TAG,
                 PacketUtil.hexDumpToString(destination.duplicate().array(), 0, 5 * read)
             )
