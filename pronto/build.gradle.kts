@@ -47,8 +47,8 @@ publishing {
             name = "GithubPackages"
             url = uri("https://maven.pkg.github.com/HonchoLtd/HonchoCameraTools")
             credentials {
-                username = "RofieSagara"
-                password = "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"
+                username = System.getenv("GITHUB_USERNAME")
+                password = System.getenv("GITHUB_TOKEN")
             }
         }
     }
