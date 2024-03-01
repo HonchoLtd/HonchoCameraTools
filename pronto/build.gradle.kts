@@ -1,6 +1,7 @@
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
+    id("maven-publish")
 }
 
 android {
@@ -29,6 +30,27 @@ android {
     }
     kotlinOptions {
         jvmTarget = "1.8"
+    }
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("release") {
+            groupId = "app.thehoncho"
+            artifactId = "pronto"
+            version = "0.2"
+            artifact("$buildDir/outputs/aar/pronto-release.aar")
+        }
+    }
+    repositories {
+        maven {
+            name = "GithubPackages"
+            url = uri("https://maven.pkg.github.com/HonchoLtd/HonchoCameraTools")
+            credentials {
+                username = "RofieSagara"
+                password = "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"
+            }
+        }
     }
 }
 
