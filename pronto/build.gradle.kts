@@ -38,7 +38,7 @@ publishing {
         create<MavenPublication>("release") {
             groupId = "app.thehoncho"
             artifactId = "pronto"
-            version = "0.2"
+            version = "0.3-snapshot"
             artifact("$buildDir/outputs/aar/pronto-release.aar")
         }
     }
