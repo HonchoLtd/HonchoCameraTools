@@ -5,6 +5,7 @@ import android.mtp.MtpConstants
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.WorkerExecutor
 import app.thehoncho.pronto.command.eos.EOSRequestPCModeCommand
+import app.thehoncho.pronto.command.general.CloseSessionCommand
 import app.thehoncho.pronto.command.general.GetDeviceInfoCommand
 import app.thehoncho.pronto.command.general.GetObjectCommand
 import app.thehoncho.pronto.command.general.GetObjectHandlesCommand
@@ -109,6 +110,9 @@ class CanonCamera(
     }
 
     private fun onConnecting(worker: WorkerExecutor): DeviceInfo? {
+        val closeSessionCommand = CloseSessionCommand(session)
+        worker.handleCommand(closeSessionCommand)
+
         val openSessionCommand = OpenSessionCommand(session)
         worker.handleCommand(openSessionCommand)
 

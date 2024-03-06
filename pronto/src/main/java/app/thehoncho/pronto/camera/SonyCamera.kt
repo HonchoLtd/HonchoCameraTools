@@ -2,6 +2,7 @@ package app.thehoncho.pronto.camera
 
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.WorkerExecutor
+import app.thehoncho.pronto.command.general.CloseSessionCommand
 import app.thehoncho.pronto.command.general.GetDeviceInfoCommand
 import app.thehoncho.pronto.command.general.GetObjectCommand
 import app.thehoncho.pronto.command.general.GetObjectInfoCommand
@@ -205,6 +206,9 @@ class SonyCamera(private val session: Session): BaseCamera() {
     }
 
     private fun onConnecting(worker: WorkerExecutor): DeviceInfo? {
+        val closeSessionCommand = CloseSessionCommand(session)
+        worker.handleCommand(closeSessionCommand)
+
         val openSessionCommand = OpenSessionCommand(session)
         worker.handleCommand(openSessionCommand)
 
