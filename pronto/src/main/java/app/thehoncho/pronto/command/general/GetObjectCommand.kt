@@ -43,8 +43,10 @@ class GetObjectCommand(
 
     override fun decodeData(b: ByteBuffer, length: Int) {
         try {
-            val bytes = ByteArray(length - 12)
             b.position(12)
+
+            // This make ByteBuffer clone, so we can use it in decodeResponse
+            val bytes = ByteArray(length - 12)
             b[bytes, 0, length - 12]
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
             content = ImageObject(bytes, bitmap)

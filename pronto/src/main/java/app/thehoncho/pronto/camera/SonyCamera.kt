@@ -99,20 +99,20 @@ class SonyCamera(private val session: Session): BaseCamera() {
                 session.log.d(TAG, "getCommand: finish download image")
             }
 
-            val event = fetchEvent(executor)
-            if (event != null) {
-                val handlerID = getHandlerObjectAdded(event)
-                if (handlerID != null) {
-                    globalHandlerID = handlerID
-                    session.log.d(TAG, "setGlobalHandler: handlerID $handlerID")
-//                    if (eventCheckCommand.content.isEmpty()) {
-//                        FirebaseCrashlytics.getInstance().log("getCommand: empty event check so we trigger with event object added")
-//                        val objectImage = onDownloadImage(worker, handlerID) // -16383
-//                        objectImage?.let { _onImageDownloaded?.invoke(it) }
-//                        Log.d(TAG, String.format("getCommand: finish download image %d",handlerID))
-//                    }
-                }
-            }
+//            val event = fetchEvent(executor)
+//            if (event != null) {
+//                val handlerID = getHandlerObjectAdded(event)
+//                if (handlerID != null) {
+//                    globalHandlerID = handlerID
+//                    session.log.d(TAG, "setGlobalHandler: handlerID $handlerID")
+////                    if (eventCheckCommand.content.isEmpty()) {
+////                        FirebaseCrashlytics.getInstance().log("getCommand: empty event check so we trigger with event object added")
+////                        val objectImage = onDownloadImage(worker, handlerID) // -16383
+////                        objectImage?.let { _onImageDownloaded?.invoke(it) }
+////                        Log.d(TAG, String.format("getCommand: finish download image %d",handlerID))
+////                    }
+//                }
+//            }
         }
         listenerCamera?.onStop()
     }

@@ -31,19 +31,19 @@ class Worker(
     private var usbRequest1: UsbRequest? = null
     private var usbRequest2: UsbRequest? = null
     private var usbRequest3: UsbRequest? = null
-    private val bigInSize = 0x4000
+    // private val bigInSize = 0x4000
 
     // buffers for async data io, size bigInSize
-    private var bigIn1: ByteBuffer? = null
-    private var bigIn2: ByteBuffer? = null
-    private var bigIn3: ByteBuffer? = null
+    // private var bigIn1: ByteBuffer? = null
+    // private var bigIn2: ByteBuffer? = null
+    // private var bigIn3: ByteBuffer? = null
 
     // buffer for small packets like command and response
     private var smallIn: ByteBuffer? = null
 
     // buffer containing full data out packet for processing
-    private val fullInSize = 0x4000
-    private var fullIn: ByteBuffer? = null
+    // private val fullInSize = 0x4000
+    // private var fullIn: ByteBuffer? = null
 
     var isRunningProcess: Boolean = false
         private set
@@ -70,19 +70,19 @@ class Worker(
                         order(ByteOrder.LITTLE_ENDIAN)
                     }
 
-                bigIn1 = ByteBuffer.allocate(bigInSize).apply {
-                    order(ByteOrder.LITTLE_ENDIAN)
-                }
-                bigIn2 = ByteBuffer.allocate(bigInSize).apply {
-                    order(ByteOrder.LITTLE_ENDIAN)
-                }
-                bigIn3 = ByteBuffer.allocate(bigInSize).apply {
-                    order(ByteOrder.LITTLE_ENDIAN)
-                }
-
-                fullIn = ByteBuffer.allocate(fullInSize).apply {
-                    order(ByteOrder.LITTLE_ENDIAN)
-                }
+//                bigIn1 = ByteBuffer.allocate(bigInSize).apply {
+//                    order(ByteOrder.LITTLE_ENDIAN)
+//                }
+//                bigIn2 = ByteBuffer.allocate(bigInSize).apply {
+//                    order(ByteOrder.LITTLE_ENDIAN)
+//                }
+//                bigIn3 = ByteBuffer.allocate(bigInSize).apply {
+//                    order(ByteOrder.LITTLE_ENDIAN)
+//                }
+//
+//                fullIn = ByteBuffer.allocate(fullInSize).apply {
+//                    order(ByteOrder.LITTLE_ENDIAN)
+//                }
 
                 usbRequest1 = connection.generatedUsbRequest()
                 usbRequest2 = connection.generatedUsbRequest()
@@ -108,21 +108,32 @@ class Worker(
         }
     }
 
-    override fun handleCommand(command: Command) {
+    // need to create new method to call encodeCommand
+    // so the GC can collect the memory after the command done
+    private fun callEncodeCommand(command: Command): ByteArray {
         val b = ByteBuffer.allocate(connection.maxPacketOutSize)
         b.order(ByteOrder.LITTLE_ENDIAN)
         b.position(0)
 
         command.encodeCommand(b)
-        val outLen = b.position()
+        b.position(0)
+        val byteArray = ByteArray(b.getInt())
+        b.position(0)
+        b[byteArray, 0, byteArray.size]
+        return byteArray
+    }
+
+    override fun handleCommand(command: Command) {
+        val b = callEncodeCommand(command)
+        val outLen = b.size
 
         // Send command to device
         logger.d(TAG, "Sending packet")
 
-        val res = connection.transferOut(b.array(), outLen, TIMEOUT)
+        val res = connection.transferOut(b, outLen, TIMEOUT)
         if (res < outLen) {
             logger.e(TAG, "handleCommand: ", Throwable("res and outLen not in same size"))
-
+            // logger.e(TAG, PacketUtil.hexDumpToString(b, 0, outLen))
             command.onError("res and outLen not in same size")
             // This make the camera stop request
             // this prob that the usb connection is cut loss so we just need to force stop worker
@@ -130,20 +141,26 @@ class Worker(
             return
         }
         logger.d(TAG, "Sending packet done with data size $res")
-        Log.d(TAG, PacketUtil.hexDumpToString(b.array(), 0, res))
+        // Log.d(TAG, PacketUtil.hexDumpToString(b.array(), 0, res))
 
         logger.d(TAG, "Reading packet")
         while (!command.hasResponseReceived) {
             val maxPacketSize: Int = connection.maxPacketInSize
             val inputBytes = requireNotNull(smallIn) { "smallIn is null" }
+            inputBytes.clear()
             inputBytes.position(0)
 
             // if the data come its events type we save to events and request again
             // if the data come its data type we start get length to get other data
             // id the data come its response type its end of the data
             val read = connection.transferIn(inputBytes.array(), maxPacketSize, 30000)
-            Log.d(TAG, String.format("Packet found with size %d", read))
-            Log.d(TAG, PacketUtil.hexDumpToString(inputBytes.duplicate().array(), 0, read))
+            if (read == 0) {
+                logger.w(TAG, "handleCommand: read is 0, lets try to request again")
+                continue
+            } else {
+                logger.d(TAG, String.format("Packet found with size %d", read))
+            }
+            // Log.d(TAG, PacketUtil.hexDumpToString(inputBytes.duplicate().array(), 0, read))
             if (read < 12) {
                 val errorMessage = String.format(
                     Locale.ENGLISH,
@@ -151,6 +168,7 @@ class Worker(
                     read
                 )
                 logger.e(TAG, errorMessage)
+                logger.e(TAG, "Failed when read header packet, its mean the camera send not anything")
 
                 command.onError(errorMessage)
                 continue
@@ -185,14 +203,12 @@ class Worker(
                 // we need to use loop in here to request with multiple
                 logger.d(TAG, "[DATA] Try to send byte to read parallel, this is data type")
 
-                val sender = ByteBuffer.allocate(read)
                 inputBytes.position(0)
-                inputBytes[sender.array(), 0, read]
 
                 logger.d(TAG, "[DATA] Start read data parallel")
 
                 val destination = ByteBuffer.allocate(length)
-                readDataParallel(sender, read, destination)
+                readDataParallel(inputBytes.array(), read, destination, length)
 
                 logger.d(TAG, "[DATA] Success read data parallel, send to command")
 
@@ -250,28 +266,32 @@ class Worker(
         return connection
     }
 
-    private fun readDataParallel(byteBuffer: ByteBuffer, read: Int, destination: ByteBuffer) {
+    private fun readDataParallel(headerByte: ByteArray, headerByteSize: Int, destination: ByteBuffer, destinationLength: Int) {
         // byte buffer its size of the item that need to read
-        val length = destination.array().size
-        byteBuffer.position(0)
+        // val length = destinationLength
+        // byteBuffer.position(0)
         destination.order(ByteOrder.LITTLE_ENDIAN)
         destination.position(0)
 
-        logger.d(TAG, String.format("readDataParallel with destination size %d", length))
+        logger.d(TAG, String.format("readDataParallel with destination size %d", destinationLength))
 
         // we put first byte from usb
-        destination.put(byteBuffer)
-        var totalBytes: Int = read
-        val maxPacketSize = 0x4000
+        destination.put(headerByte, 0, headerByteSize)
+        var totalBytes: Int = headerByteSize
+        val maxPacketSize = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P){
+            0x100000
+        } else {
+            0x4000
+        }
 
-        while (totalBytes < length) {
+        while (totalBytes < destinationLength) {
             // Read its not enough so the data will be partial
             // let say A need 10000 data but we just read 512 that max the data can hold it
             // 0x4000 that max the data can read by queue with UsbRequest
             // and B just need 1000 - 512 = 488 if the 488 the sizeB need to read
-            val sizeA = maxPacketSize.coerceAtMost(length - totalBytes)
-            val sizeB = 0.coerceAtLeast(maxPacketSize.coerceAtMost(length - totalBytes - sizeA))
-            val sizeC = 0.coerceAtLeast(maxPacketSize.coerceAtMost(length - totalBytes - sizeA - sizeB))
+            val sizeA = maxPacketSize.coerceAtMost(destinationLength - totalBytes)
+            val sizeB = 0.coerceAtLeast(maxPacketSize.coerceAtMost(destinationLength - totalBytes - sizeA))
+            val sizeC = 0.coerceAtLeast(maxPacketSize.coerceAtMost(destinationLength - totalBytes - sizeA - sizeB))
 
             val byteA = ByteBuffer.allocate(sizeA)
             byteA.order(ByteOrder.LITTLE_ENDIAN)
@@ -314,7 +334,11 @@ class Worker(
                 }
             }
             if (sizeA > 0) {
-                connection.requestWait()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    connection.requestWait(5000)
+                } else {
+                    connection.requestWait()
+                }
                 val sender = ByteBuffer.allocate(sizeA)
                 byteA.position(0)
                 byteA[sender.array(), 0, sizeA]
@@ -326,14 +350,18 @@ class Worker(
                     String.format(
                         "readDataParallel Total bytes read from A %d and destination size %d with totalBytes %d position %d",
                         sizeA,
-                        destination.array().size,
+                        destinationLength,
                         totalBytes,
                         destination.position()
                     )
                 )
             }
             if (sizeB > 0) {
-                connection.requestWait()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    connection.requestWait(5000)
+                } else {
+                    connection.requestWait()
+                }
                 val sender = ByteBuffer.allocate(sizeB)
                 byteB.position(0)
                 byteB[sender.array(), 0, sizeB]
@@ -345,14 +373,18 @@ class Worker(
                     String.format(
                         "readDataParallel Total bytes read from B %d and destination size %d with totalBytes %d position %d",
                         sizeB,
-                        destination.array().size,
+                        destinationLength,
                         totalBytes,
                         destination.position()
                     )
                 )
             }
             if (sizeC > 0) {
-                connection.requestWait()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    connection.requestWait(5000)
+                } else {
+                    connection.requestWait()
+                }
                 val sender = ByteBuffer.allocate(sizeC)
                 byteC.position(0)
                 byteC[sender.array(), 0, sizeC]
@@ -364,7 +396,7 @@ class Worker(
                     String.format(
                         "readDataParallel Total bytes read from C %d and destination size %d with totalBytes %d position %d",
                         sizeC,
-                        destination.array().size,
+                        destinationLength,
                         totalBytes,
                         destination.position()
                     )
@@ -372,19 +404,19 @@ class Worker(
             }
         }
         destination.position(0)
-        if (totalBytes > 5 * read) {
-            Log.d(
-                TAG,
-                PacketUtil.hexDumpToString(destination.duplicate().array(), 0, 5 * read)
-            )
-        }
+//        if (totalBytes > 5 * read) {
+//            Log.d(
+//                TAG,
+//                PacketUtil.hexDumpToString(destination.duplicate().array(), 0, 5 * read)
+//            )
+//        }
 
         logger.d(
             TAG,
             String.format(
                 "readDataParallel Success read data parallel with totalBytes %d and destination size %d",
                 totalBytes,
-                destination.array().size
+                destinationLength
             )
         )
     }

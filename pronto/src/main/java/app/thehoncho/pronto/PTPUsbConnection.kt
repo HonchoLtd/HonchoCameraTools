@@ -8,7 +8,9 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.hardware.usb.UsbRequest
+import android.os.Build
 import android.util.Log
+import androidx.annotation.RequiresApi
 import java.util.Objects
 
 class PTPUsbConnection(
@@ -63,6 +65,11 @@ class PTPUsbConnection(
 
     fun requestWait(): UsbRequest {
         return usbDeviceConnection.requestWait()
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    fun requestWait(timeout: Long): UsbRequest {
+        return usbDeviceConnection.requestWait(timeout)
     }
 
     fun transferOut(buffer: ByteArray?, length: Int, timeout: Int): Int {

@@ -5,6 +5,7 @@ import app.thehoncho.pronto.command.Command
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.utils.PtpConstants
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class GetDeviceInfoCommand(session: Session) : Command(session) {
     private var content: DeviceInfo? = null
@@ -28,7 +29,17 @@ class GetDeviceInfoCommand(session: Session) : Command(session) {
 
     override fun decodeData(b: ByteBuffer, length: Int) {
         try {
-            content = DeviceInfo(b, length)
+            val currentPosition = b.position()
+            b.position(0)
+
+            val bytes = ByteArray(length)
+            b[bytes, 0, length]
+
+            val bytesBuffer = ByteBuffer.wrap(bytes)
+            bytesBuffer.order(ByteOrder.LITTLE_ENDIAN)
+            bytesBuffer.position(currentPosition)
+
+            content = DeviceInfo(bytesBuffer, length)
         } catch (throwable: Throwable) {
             this.throwable = throwable
         }

@@ -209,8 +209,7 @@ object PtpConstants {
         const val PTP_OC_SONY_SetControlDeviceA = 0x9205
         const val PTP_OC_SONY_SetControlDeviceB = 0x9207
         const val PTP_OC_SONY_SDIOConnect = 0x9201
-        const val PTP_OC_SONY_GetAllDevicePropData =
-            0x9209 // This will be get data and event if there is event included
+        const val PTP_OC_SONY_GetAllDevicePropData = 0x9209 // This will be get data and event if there is event included
         const val PTP_OC_SONY_GUESS = 0x9280
         const val PTP_OC_SONY = 0x9281
         const val PTP_OC_SONY_GetSDIOGetExtDeviceInfo = 0x9202
