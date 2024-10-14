@@ -18,6 +18,7 @@ import app.thehoncho.pronto.model.ObjectInfo
 import app.thehoncho.pronto.model.sony.SonyDevicePropDesc
 import app.thehoncho.pronto.utils.PacketUtil
 import app.thehoncho.pronto.utils.PtpConstants
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import java.lang.Integer.max
 import java.nio.ByteBuffer
@@ -97,6 +98,8 @@ class SonyCamera(private val session: Session): BaseCamera() {
                 }
                 objectImage?.let { listenerCamera?.onImageDownloaded(it) }
                 session.log.d(TAG, "getCommand: finish download image")
+            } else {
+                delay(3000)
             }
 
 //            val event = fetchEvent(executor)

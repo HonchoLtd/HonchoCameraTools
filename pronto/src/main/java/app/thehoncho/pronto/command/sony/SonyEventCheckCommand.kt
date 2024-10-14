@@ -75,14 +75,14 @@ class SonyEventCheckCommand(session: Session): Command(session) {
             var formFlag: Short = 0
             // int[] description = null;
 
-            val message = String.format(
-                "propCode 0x%04X, dataType 0x%04X, changeMethod 0x%02X, getSet 0x%02X",
-                propCode,
-                dataType,
-                changeMethod,
-                getSet
-            );
-            session.log.d(TAG, message);
+//            val message = String.format(
+//                "propCode 0x%04X, dataType 0x%04X, changeMethod 0x%02X, getSet 0x%02X",
+//                propCode,
+//                dataType,
+//                changeMethod,
+//                getSet
+//            );
+//            session.log.d(TAG, message);
 
             if (dataType == PtpConstants.Datatype.int8.toShort() || dataType == PtpConstants.Datatype.uint8.toShort()) {
                 defaultValue = b.get().toLong()

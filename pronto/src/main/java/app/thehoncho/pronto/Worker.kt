@@ -279,7 +279,8 @@ class Worker(
         destination.put(headerByte, 0, headerByteSize)
         var totalBytes: Int = headerByteSize
         val maxPacketSize = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P){
-            0x100000
+            //0x100000
+            0x4000
         } else {
             0x4000
         }
@@ -334,11 +335,7 @@ class Worker(
                 }
             }
             if (sizeA > 0) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    connection.requestWait(5000)
-                } else {
-                    connection.requestWait()
-                }
+                connection.requestWait()
                 val sender = ByteBuffer.allocate(sizeA)
                 byteA.position(0)
                 byteA[sender.array(), 0, sizeA]
@@ -357,11 +354,7 @@ class Worker(
                 )
             }
             if (sizeB > 0) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    connection.requestWait(5000)
-                } else {
-                    connection.requestWait()
-                }
+                connection.requestWait()
                 val sender = ByteBuffer.allocate(sizeB)
                 byteB.position(0)
                 byteB[sender.array(), 0, sizeB]
@@ -380,11 +373,7 @@ class Worker(
                 )
             }
             if (sizeC > 0) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    connection.requestWait(5000)
-                } else {
-                    connection.requestWait()
-                }
+                connection.requestWait()
                 val sender = ByteBuffer.allocate(sizeC)
                 byteC.position(0)
                 byteC[sender.array(), 0, sizeC]

@@ -67,7 +67,7 @@ class CameraWorker(
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            applicationContext.registerReceiver(usbReceiver, filter, ComponentActivity.RECEIVER_NOT_EXPORTED)
+            applicationContext.registerReceiver(usbReceiver, filter)
         } else {
             applicationContext.registerReceiver(usbReceiver, filter)
         }

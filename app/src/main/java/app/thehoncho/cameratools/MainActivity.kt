@@ -137,7 +137,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onNewIntent(intent: Intent?) {
+    override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
 
         if (intent == null) return
@@ -153,7 +153,7 @@ class MainActivity : ComponentActivity() {
             this,
             0,
             Intent(ACTION_USB_PERMISSION),
-            PendingIntent.FLAG_MUTABLE // Should be FLAG_MUTABLE to let usbManager to update the extra with usbDevice
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_NO_CREATE// Should be FLAG_MUTABLE to let usbManager to update the extra with usbDevice
         )
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
