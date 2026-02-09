@@ -88,7 +88,23 @@ class CanonCamera(
                         listenerCamera?.onStop()
                         return@runBlocking
                     }
-                    getObjectInfo.getResult().getOrNull()?.let { cacheImage[handler] = it  }
+                    getObjectInfo.getResult().getOrNull()?.let { info ->
+                        val name = info.filename?.uppercase() ?: ""
+                        if (info.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
+                            (name.endsWith(".JPG") || name.endsWith(".JPEG"))
+                        ) {
+                            // Check if filename already exists in cache
+                            val alreadyCached = cacheImage.values.any { it.filename?.uppercase() == name }
+                            if (!alreadyCached) {
+                                cacheImage[handler] = info
+                                session.log.d(TAG, "Cached JPEG object: $name (Handler: $handler)")
+                            } else {
+                                session.log.d(TAG, "Skipping duplicate filename: $name (Handler: $handler)")
+                            }
+                        } else {
+                            session.log.d(TAG, "Skipping non-JPEG object: $name (Format: ${info.objectFormat})")
+                        }
+                    }
                 }
             }
 
