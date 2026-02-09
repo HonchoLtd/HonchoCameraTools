@@ -4,6 +4,7 @@ import android.graphics.BitmapFactory
 import android.mtp.MtpConstants
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.WorkerExecutor
+import app.thehoncho.pronto.command.Command
 import app.thehoncho.pronto.command.eos.EOSRequestPCModeCommand
 import app.thehoncho.pronto.command.general.CloseSessionCommand
 import app.thehoncho.pronto.command.general.GetDeviceInfoCommand
@@ -18,6 +19,7 @@ import app.thehoncho.pronto.model.ImageObject
 import app.thehoncho.pronto.model.ObjectImage
 import app.thehoncho.pronto.model.ObjectInfo
 import app.thehoncho.pronto.utils.PtpConstants
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import java.nio.ByteBuffer
 
@@ -48,7 +50,7 @@ class CanonCamera(
         val getStorageIds = GetStorageIdsCommand(session)
         executor.handleCommand(getStorageIds)
         getStorageIds.getResult().onFailure {
-            session.log.e(TAG, "execute: failed when get storage ids, maybe storage empty")
+            session.log.e(TAG, "execute: failed when get storage ids, maybe storage empty. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
             listenerCamera?.onError(Throwable("failed when get storage ids, please check the sd card"))
             listenerCamera?.onStop()
             return@runBlocking
@@ -56,7 +58,7 @@ class CanonCamera(
         val storageIds = getStorageIds.getResult().getOrNull() ?: IntArray(0)
 
         if (storageIds.isEmpty()) {
-            session.log.e(TAG, "execute: storageIds is empty")
+            session.log.e(TAG, "execute: storageIds is empty. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
             listenerCamera?.onError(Throwable("storage ids is empty, please check the sd card"))
             listenerCamera?.onStop()
             return@runBlocking
@@ -67,10 +69,8 @@ class CanonCamera(
             session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
             storageIds.forEach { storage ->
                 session.log.d(TAG, "execute: get handlers with storage $storage")
-                val getHandlersCommand = GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
-                executor.handleCommand(getHandlersCommand)
-                getHandlersCommand.getResult().onFailure {
-                    session.log.w(TAG, "execute: failed when get handlers, maybe the handler its empty")
+                val getHandlersCommand = handlerCommandRetry(session, executor) {
+                    GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
                 }
 
                 val handlers = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
@@ -79,10 +79,11 @@ class CanonCamera(
                 val handlerNotCache = handlers.filterNot { cacheImage.keys.contains(it) }
                 session.log.d(TAG, "execute: get handlers with total ${handlerNotCache.size} handlers not cache on storage $storage")
                 handlerNotCache.forEach { handler ->
-                    val getObjectInfo = GetObjectInfoCommand(session, handler)
-                    executor.handleCommand(getObjectInfo)
+                    val getObjectInfo =  handlerCommandRetry(session, executor) {
+                        GetObjectInfoCommand(session, handler)
+                    }
                     getObjectInfo.getResult().onFailure {
-                        session.log.e(TAG, "execute: failed when get object info, please restart the camera")
+                        session.log.e(TAG, "execute: failed when get object info, please restart the camera. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
                         listenerCamera?.onError(Throwable("failed when get object info $handler, please restart the camera"))
                         listenerCamera?.onStop()
                         return@runBlocking
@@ -98,7 +99,7 @@ class CanonCamera(
             getCleanHandlers.forEach { handler ->
                 val objectImage = onDownloadImage(executor, handler.handlerID)
                 if (objectImage == null) {
-                    session.log.e(TAG, "execute: failed when download image $handler")
+                    session.log.e(TAG, "execute: failed when download image $handler. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
                     listenerCamera?.onError(Throwable("failed when download image $handler, please restart the camera"))
                     listenerCamera?.onStop()
                     return@runBlocking
@@ -129,9 +130,10 @@ class CanonCamera(
         return getDeviceInfoCommand.getResult().getOrNull()
     }
 
-    private fun onDownloadImage(worker: WorkerExecutor, handler: Int): ObjectImage? {
-        val getObjectInfoCommand = GetObjectInfoCommand(session, handler)
-        worker.handleCommand(getObjectInfoCommand)
+    private suspend fun onDownloadImage(worker: WorkerExecutor, handler: Int): ObjectImage? {
+        val getObjectInfoCommand = handlerCommandRetry(session, worker) {
+            GetObjectInfoCommand(session, handler)
+        }
         getObjectInfoCommand.getResult().onFailure {
             session.log.w(TAG, "onDownloadImage: failed when download info image $handler")
         }
@@ -149,10 +151,11 @@ class CanonCamera(
         }
     }
 
-    private fun downloadImage(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
+    private suspend fun downloadImage(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
         session.log.d(TAG, "downloadImage: start download image $handler")
-        val getObjectCommand = GetObjectCommand(session, handler)
-        worker.handleCommand(getObjectCommand)
+        val getObjectCommand = handlerCommandRetry(session, worker) {
+            GetObjectCommand(session, handler)
+        }
         getObjectCommand.getResult().onFailure {
             session.log.w(TAG, "downloadImage: failed when download image data $handler")
         }
@@ -167,7 +170,7 @@ class CanonCamera(
         return ObjectImage(objectInfo, handler, imageObject)
     }
 
-    private fun downloadImagePartial(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
+    private suspend fun downloadImagePartial(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
         session.log.d(TAG, "downloadImagePartial: start download image $handler")
         var offset = 0
         val totalBytes = objectInfo.objectCompressedSize
@@ -183,9 +186,11 @@ class CanonCamera(
 
             val finalOffset = offset
             val finalSize = size
-            val partialObjectCommand = GetObjectPartial(session, handler, finalOffset, finalSize)
+            val partialObjectCommand = handlerCommandRetry(session, worker) {
+                GetObjectPartial(session, handler, finalOffset, finalSize)
+            }
             session.log.d(TAG, "downloadImagePartial: consume command")
-            worker.handleCommand(partialObjectCommand)
+
             partialObjectCommand.getResult().onFailure {
                 session.log.w(TAG, "downloadImagePartial: failed when download partial image $handler")
             }
@@ -214,6 +219,19 @@ class CanonCamera(
 
         session.log.d(TAG, "downloadImagePartial: finish download image")
         return ObjectImage(objectInfo, handler, ImageObject(imageBytes, bitmap))
+    }
+
+    private suspend fun <T: Command>handlerCommandRetry(session: Session,worker: WorkerExecutor, getCommand: ()-> T): T {
+        while(worker.isRunning()) {
+            val command = getCommand()
+            worker.handleCommand(command)
+            if(!command.isRetry()) {
+                return command
+            }
+            session.log.e(TAG, "${command::class.simpleName} request retry")
+            delay(500L)
+        }
+        error("Worker is shutting down")
     }
 
     companion object {

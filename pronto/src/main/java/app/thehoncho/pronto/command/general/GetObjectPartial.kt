@@ -44,17 +44,17 @@ class GetObjectPartial(
 
     override fun decodeResponse(b: ByteBuffer, length: Int) {
         if (responseCode == PtpConstants.Response.GeneralError) {
-            session.log.e(TAG, "response code its not OK")
+            session.log.e(TAG, "response code its not OK $responseCode")
             throwable = Throwable("response code its not OK")
         } else if (responseCode == PtpConstants.Response.Ok) {
             if (content != null) {
                 session.log.d(TAG, "response code its OK")
             } else {
-                session.log.e(TAG, "response code its OK but content is null")
+                session.log.e(TAG, "response code its OK but content is null $responseCode")
                 throwable = Throwable("response code its OK but content is null")
             }
         } else {
-            session.log.e(TAG, "response code its not OK")
+            session.log.e(TAG, "response code its not OK $responseCode")
             throwable = Throwable("response code its not OK")
         }
     }

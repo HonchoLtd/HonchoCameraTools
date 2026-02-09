@@ -117,6 +117,10 @@ abstract class Command(protected val session: Session): PTPAction {
         byteBuffer.putInt(p2)
     }
 
+    public fun isRetry(): Boolean {
+        return responseCode == PtpConstants.Response.DeviceBusy || responseCode == PtpConstants.Response.StoreNotAvailable
+    }
+
     companion object {
         const val TAG = "Command"
     }

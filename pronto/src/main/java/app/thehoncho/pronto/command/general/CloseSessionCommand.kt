@@ -28,13 +28,13 @@ class CloseSessionCommand(session: Session): Command(session) {
     override fun decodeResponse(b: ByteBuffer, length: Int) {
         when (responseCode) {
             PtpConstants.Response.GeneralError -> {
-                session.log.e(TAG, "response code its not OK")
+                session.log.e(TAG, "response code its not OK $responseCode")
             }
             PtpConstants.Response.Ok -> {
                 session.log.d(TAG, "response code its OK")
             }
             else -> {
-                session.log.e(TAG, "response code its not OK")
+                session.log.e(TAG, "response code its not OK $responseCode")
             }
         }
     }

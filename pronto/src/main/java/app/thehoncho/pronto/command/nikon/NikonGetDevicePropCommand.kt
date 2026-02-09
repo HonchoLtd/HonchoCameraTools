@@ -28,14 +28,14 @@ class NikonGetDevicePropCommand(session: Session): Command(session) {
     override fun decodeResponse(b: ByteBuffer, length: Int) {
         when (responseCode) {
             PtpConstants.Response.GeneralError -> {
-                session.log.e(NikonGetDevicePropCommand.TAG, "response code its not OK")
+                session.log.e(NikonGetDevicePropCommand.TAG, "response code its not OK $responseCode")
                 throwable = Throwable("response code its not OK")
             }
             PtpConstants.Response.Ok -> {
                 session.log.d(NikonGetDevicePropCommand.TAG, "response code its OK")
             }
             else -> {
-                session.log.e(NikonGetDevicePropCommand.TAG, "response code its not OK")
+                session.log.e(NikonGetDevicePropCommand.TAG, "response code its not OK $responseCode")
                 throwable = Throwable("response code its not OK")
             }
         }
