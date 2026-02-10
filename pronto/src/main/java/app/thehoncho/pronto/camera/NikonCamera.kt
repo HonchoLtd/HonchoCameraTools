@@ -8,6 +8,7 @@ import app.thehoncho.pronto.command.Command
 import app.thehoncho.pronto.command.eos.EOSRequestPCModeCommand
 import app.thehoncho.pronto.command.general.CloseSessionCommand
 import app.thehoncho.pronto.command.general.GetDeviceInfoCommand
+import app.thehoncho.pronto.command.general.GetNumObjectsCommand
 import app.thehoncho.pronto.command.general.GetObjectCommand
 import app.thehoncho.pronto.command.general.GetObjectHandlesCommand
 import app.thehoncho.pronto.command.general.GetObjectInfoCommand
@@ -68,11 +69,29 @@ class NikonCamera(
 
         var finishLoadStorageImage = false
         listenerCamera?.onReady()
+        var currentTotalImages = 0
         while (executor.isRunning()) {
             if (!finishLoadStorageImage) {
                 session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
                 storageIds.forEach { storage ->
                     session.log.d(TAG, "execute: get handlers with storage $storage")
+                    val getNumObjectsCommand = handlerCommandRetry(session, executor) {
+                        GetNumObjectsCommand(session, storage)
+                    }
+                    val latestTotalImages = getNumObjectsCommand.getResult().getOrDefault(0)
+                    session.log.d(TAG, "execute: Total objects: $latestTotalImages ")
+
+                    session.log.d(TAG, "execute: Total current=$currentTotalImages latest=$latestTotalImages")
+
+                    if (latestTotalImages > 0 && currentTotalImages == latestTotalImages) {
+                        session.log.d(TAG, "execute: Total counts match, skipping handler query")
+                        currentTotalImages = latestTotalImages
+                        return@forEach
+                    } else {
+                        session.log.d(TAG, "execute: Total counts differ, updating and fetching handlers")
+                        currentTotalImages = latestTotalImages
+                    }
+
                     val getHandlersCommand = handlerCommandRetry(session,executor) {
                         GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
                     }

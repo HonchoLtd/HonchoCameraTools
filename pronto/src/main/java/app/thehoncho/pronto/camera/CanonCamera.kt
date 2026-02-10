@@ -5,9 +5,11 @@ import android.mtp.MtpConstants
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.WorkerExecutor
 import app.thehoncho.pronto.command.Command
+import app.thehoncho.pronto.command.eos.EOSGetEventCommand
 import app.thehoncho.pronto.command.eos.EOSRequestPCModeCommand
 import app.thehoncho.pronto.command.general.CloseSessionCommand
 import app.thehoncho.pronto.command.general.GetDeviceInfoCommand
+import app.thehoncho.pronto.command.general.GetNumObjectsCommand
 import app.thehoncho.pronto.command.general.GetObjectCommand
 import app.thehoncho.pronto.command.general.GetObjectHandlesCommand
 import app.thehoncho.pronto.command.general.GetObjectInfoCommand
@@ -65,10 +67,31 @@ class CanonCamera(
         }
 
         listenerCamera?.onReady()
+        var currentTotalImages = 0
         while (executor.isRunning()) {
             session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
+            val getEventCommand = EOSGetEventCommand(session)
+            executor.handleCommand(getEventCommand)
+            session.log.d(TAG, "execute: flush")
             storageIds.forEach { storage ->
                 session.log.d(TAG, "execute: get handlers with storage $storage")
+                val getNumObjectsCommand = handlerCommandRetry(session, executor) {
+                    GetNumObjectsCommand(session, storage)
+                }
+                val latestTotalImages = getNumObjectsCommand.getResult().getOrDefault(0)
+                session.log.d(TAG, "execute: Total objects: $latestTotalImages ")
+
+                session.log.d(TAG, "execute: Total current=$currentTotalImages latest=$latestTotalImages")
+
+                if (latestTotalImages > 0 && currentTotalImages == latestTotalImages) {
+                    session.log.d(TAG, "execute: Total counts match, skipping handler query")
+                    currentTotalImages = latestTotalImages
+                    return@forEach
+                } else {
+                    session.log.d(TAG, "execute: Total counts differ, updating and fetching handlers")
+                    currentTotalImages = latestTotalImages
+                }
+
                 val getHandlersCommand = handlerCommandRetry(session, executor) {
                     GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
                 }
@@ -117,6 +140,9 @@ class CanonCamera(
             session.log.d(TAG, "execute: get handlers with total ${getCleanHandlers.size} handlers clean")
 
             getCleanHandlers.forEach { handler ->
+                val getEventCommand = EOSGetEventCommand(session)
+                executor.handleCommand(getEventCommand)
+                session.log.d(TAG, "execute getCleanHandlers: flush before download image")
                 val objectImage = onDownloadImage(executor, handler.handlerID)
                 if (objectImage == null) {
                     session.log.e(TAG, "execute: failed when download image $handler. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
