@@ -102,13 +102,17 @@ class NikonCamera(
                             if (info.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
                                 (name.endsWith(".JPG") || name.endsWith(".JPEG"))
                             ) {
-                                // Check if filename already exists in cache
-                                val alreadyCached = cacheImage.values.any { it.filename?.uppercase() == name }
+                                // Check if filename + captureDate already exists in cache
+                                val alreadyCached = cacheImage.values.any {
+                                    it.filename?.uppercase() == name.uppercase() &&
+                                            it.captureDate == info.captureDate
+                                }
+
                                 if (!alreadyCached) {
                                     cacheImage[handler] = info
-                                    session.log.d(TAG, "Cached JPEG object: $name (Handler: $handler)")
+                                    session.log.d(TAG, "Cached JPEG object: $name (Handler: $handler, CaptureDate: ${info.captureDate})")
                                 } else {
-                                    session.log.d(TAG, "Skipping duplicate filename: $name (Handler: $handler)")
+                                    session.log.d(TAG, "Skipping duplicate filename+date: $name (Handler: $handler, CaptureDate: ${info.captureDate})")
                                 }
                             } else {
                                 session.log.d(TAG, "Skipping non-JPEG object: $name (Format: ${info.objectFormat})")
