@@ -10,7 +10,7 @@ class StorageInfo(b: ByteBuffer, length: Int) {
     var maxCapacity: Long = 0
     var freeSpaceInBytes: Long = 0
     var freeSpaceInImages = 0
-    var storageDescription: Short = 0
+    var storageDescription: String? = null
     var volumeLabel: String? = null
 
     init { decode(b, length) }
@@ -22,7 +22,11 @@ class StorageInfo(b: ByteBuffer, length: Int) {
         maxCapacity = b.long
         freeSpaceInBytes = b.long
         freeSpaceInImages = b.int
-        storageDescription = b.get().toShort()
+        storageDescription = PacketUtil.readString(b)
+        if (storageDescription.isNullOrEmpty()) {
+            // Canon: field not used
+            storageDescription = null
+        }
         volumeLabel = PacketUtil.readString(b)
     }
 }
