@@ -30,12 +30,6 @@ class GetStorageInfoCommand(session: Session, val storageId: Int)  : Command(ses
     override fun decodeData(b: ByteBuffer, length: Int) {
         try {
             val currentPosition = b.position()
-            session.log.d(TAG, "decodeData start: length=$length, pos=$currentPosition, limit=${b.limit()}, remaining=${b.remaining()}, order=${b.order()}")
-
-            // Snapshot without advancing original buffer
-            val snapshot = ByteArray(b.remaining())
-            b.slice().get(snapshot)
-            session.log.d(TAG, "decodeData raw snapshot: ${snapshot.joinToString(" ") { String.format("%02X", it) }}")
             b.position(0)
 
             val bytes = ByteArray(length)
