@@ -74,12 +74,16 @@ class NikonCamera(
         val validStorageIds = mutableListOf<Int>()
         storageIds.forEach { storage ->
             val getStorageInfoCmd = GetStorageInfoCommand(session, storage)
-
+            session.log.d(TAG, "Checking storage $storage with GetStorageInfoCommand")
+            executor.handleCommand(getStorageInfoCmd)
+            session.log.d(TAG, "Executed GetStorageInfoCommand for $storage")
             val storageInfoResult = getStorageInfoCmd.getResult()
+            session.log.d(TAG, "Result for $storage: $storageInfoResult")
             storageInfoResult.onFailure {
                 session.log.e(TAG, "Failed to get storage info for $storage: ${it.message}")
             }
             storageInfoResult.getOrNull()?.let { info ->
+                session.log.d(TAG, "Storage $storage info: type=${info.storageType}, fsType=${info.filesystemType}, maxCapacity=${info.maxCapacity}, freeSpace=${info.freeSpaceInBytes}")
                 if (info.maxCapacity > 0) {
                     validStorageIds.add(storage)
                     session.log.d(TAG, "Storage $storage is valid with capacity ${info.maxCapacity}")
