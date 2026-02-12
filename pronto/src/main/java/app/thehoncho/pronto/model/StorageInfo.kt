@@ -23,10 +23,6 @@ class StorageInfo(b: ByteBuffer, length: Int) {
         freeSpaceInBytes = b.long
         freeSpaceInImages = b.int
         storageDescription = PacketUtil.readString(b)
-        if (storageDescription.isNullOrEmpty()) {
-            // Canon: field not used
-            storageDescription = null
-        }
         volumeLabel = PacketUtil.readString(b)
     }
 }
