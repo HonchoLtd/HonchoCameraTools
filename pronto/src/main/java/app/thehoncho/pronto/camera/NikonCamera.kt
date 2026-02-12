@@ -14,6 +14,7 @@ import app.thehoncho.pronto.command.general.GetObjectHandlesCommand
 import app.thehoncho.pronto.command.general.GetObjectInfoCommand
 import app.thehoncho.pronto.command.general.GetObjectPartial
 import app.thehoncho.pronto.command.general.GetStorageIdsCommand
+import app.thehoncho.pronto.command.general.GetStorageInfoCommand
 import app.thehoncho.pronto.command.general.OpenSessionCommand
 import app.thehoncho.pronto.command.nikon.NikonGetDevicePropCommand
 import app.thehoncho.pronto.command.nikon.NikonGetEventCommand
@@ -69,11 +70,30 @@ class NikonCamera(
 
         var finishLoadStorageImage = false
         listenerCamera?.onReady()
-        var currentTotalImages = 0
+        // Pre-check storage info before looping
+        val validStorageIds = mutableListOf<Int>()
+        storageIds.forEach { storage ->
+            val getStorageInfoCmd = GetStorageInfoCommand(session, storage)
+
+            val storageInfoResult = getStorageInfoCmd.getResult()
+            storageInfoResult.onFailure {
+                session.log.e(TAG, "Failed to get storage info for $storage: ${it.message}")
+            }
+            storageInfoResult.getOrNull()?.let { info ->
+                if (info.maxCapacity > 0) {
+                    validStorageIds.add(storage)
+                    session.log.d(TAG, "Storage $storage is valid with capacity ${info.maxCapacity}")
+                } else {
+                    session.log.e(TAG, "Storage $storage has maxCapacity=0, skipping")
+                }
+            }
+        }
+
+        val currentTotalImageByStorage = mutableMapOf<Int, Int>()
         while (executor.isRunning()) {
             if (!finishLoadStorageImage) {
                 session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
-                storageIds.forEach { storage ->
+                validStorageIds.forEach { storage ->
                     session.log.d(TAG, "execute: get handlers with storage $storage")
                     val getNumObjectsCommand = handlerCommandRetry(session, executor) {
                         GetNumObjectsCommand(session, storage)
@@ -81,15 +101,15 @@ class NikonCamera(
                     val latestTotalImages = getNumObjectsCommand.getResult().getOrDefault(0)
                     session.log.d(TAG, "execute: Total objects: $latestTotalImages ")
 
-                    session.log.d(TAG, "execute: Total current=$currentTotalImages latest=$latestTotalImages")
+                    session.log.d(TAG, "execute: Total current=${currentTotalImageByStorage[storage]} latest=$latestTotalImages")
 
-                    if (latestTotalImages > 0 && currentTotalImages == latestTotalImages) {
-                        session.log.d(TAG, "execute: Total counts match, skipping handler query")
-                        currentTotalImages = latestTotalImages
+                    if (latestTotalImages > 0 && currentTotalImageByStorage[storage] == latestTotalImages) {
+                        session.log.d(TAG, "execute: counts match for storage $storage, skipping handler query")
+                        currentTotalImageByStorage[storage] = latestTotalImages
                         return@forEach
                     } else {
-                        session.log.d(TAG, "execute: Total counts differ, updating and fetching handlers")
-                        currentTotalImages = latestTotalImages
+                        session.log.d(TAG, "execute: counts differ for storage $storage, updating and fetching handlers")
+                        currentTotalImageByStorage[storage] = latestTotalImages
                     }
 
                     val getHandlersCommand = handlerCommandRetry(session,executor) {

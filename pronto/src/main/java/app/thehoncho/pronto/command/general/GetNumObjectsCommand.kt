@@ -3,7 +3,6 @@ package app.thehoncho.pronto.command.general
 import android.mtp.MtpConstants
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.command.Command
-import app.thehoncho.pronto.utils.PacketUtil
 import app.thehoncho.pronto.utils.PtpConstants
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
