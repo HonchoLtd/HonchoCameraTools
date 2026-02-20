@@ -76,24 +76,33 @@ class NikonCamera(
             val getStorageInfoCmd = GetStorageInfoCommand(session, storage)
             session.log.d(TAG, "Checking storage $storage with GetStorageInfoCommand")
             executor.handleCommand(getStorageInfoCmd)
-            session.log.d(TAG, "Executed GetStorageInfoCommand for $storage")
-            val storageInfoResult = getStorageInfoCmd.getResult()
-            session.log.d(TAG, "Result for $storage: $storageInfoResult")
-            storageInfoResult.onFailure {
-                session.log.e(TAG, "Failed to get storage info for $storage: ${it.message}")
-            }
-            storageInfoResult.getOrNull()?.let { info ->
-                session.log.d(TAG, "Storage $storage info: type=${info.storageType}, fsType=${info.filesystemType}, maxCapacity=${info.maxCapacity}, freeSpace=${info.freeSpaceInBytes}")
-                if (info.maxCapacity > 0) {
-                    validStorageIds.add(storage)
-                    session.log.d(TAG, "Storage $storage is valid with capacity ${info.maxCapacity}")
-                } else {
-                    session.log.e(TAG, "Storage $storage has maxCapacity=0, skipping")
+            when(getStorageInfoCmd.responseCode) {
+                PtpConstants.Response.Ok -> {
+                    session.log.d(TAG, "Executed GetStorageInfoCommand for $storage")
+                    val storageInfoResult = getStorageInfoCmd.getResult()
+                    session.log.d(TAG, "Result for $storage: $storageInfoResult")
+                    storageInfoResult.getOrNull()?.let { info ->
+                        session.log.d(TAG, "Storage $storage info: type=${info.storageType}, fsType=${info.filesystemType}, maxCapacity=${info.maxCapacity}, freeSpace=${info.freeSpaceInBytes}")
+                        if (info.maxCapacity > 0) {
+                            validStorageIds.add(storage)
+                            session.log.d(TAG, "Storage $storage is valid with capacity ${info.maxCapacity}")
+                        } else {
+                            session.log.e(TAG, "Storage $storage has maxCapacity=0, skipping")
+                        }
+                    }
+                }
+                PtpConstants.Response.StoreNotAvailable -> {
+                    session.log.w(TAG, "Storage Not Available id: $storage")
+                }
+                else -> {
+                    session.log.e(TAG, "Storage: Cannot populate storage, please check the storage")
+                    listenerCamera?.onError(Throwable("Cannot populate storage, please check the storage"))
+                    listenerCamera?.onStop()
+                    return@runBlocking
                 }
             }
         }
 
-        val currentTotalImageByStorage = mutableMapOf<Int, Int>()
         while (executor.isRunning()) {
             if (!finishLoadStorageImage) {
                 session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
@@ -211,17 +220,29 @@ class NikonCamera(
                     if (info?.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
                         (name.endsWith(".JPG") || name.endsWith(".JPEG"))) {
                         session.log.d(TAG, "Candidate JPEG handler: $handler, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
-                        cacheImage[handler] = info
-                        val objectImage = onDownloadImage(executor, handler)
-                        if (objectImage == null) {
-                            session.log.e(TAG, "execute: failed when download image $it.parameter")
-                            listenerCamera?.onError(Throwable("failed when download image $it.parameter, please restart the camera"))
-                            listenerCamera?.onStop()
-                            return@runBlocking
+
+                        // ✅ Check if filename+captureDate already exists in cache
+                        val alreadyCached = cacheImage.values.any {
+                            it.filename?.uppercase() == name
                         }
-                        objectImage.let { image -> listenerCamera?.onImageDownloaded(image) }
+
+                        if (!alreadyCached) {
+                            session.log.d(TAG, "Candidate JPEG handler: $handler, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
+                            cacheImage[handler] = info
+
+                            val objectImage = onDownloadImage(executor, handler)
+                            if (objectImage == null) {
+                                session.log.e(TAG, "execute: failed when download image $handler")
+                                listenerCamera?.onError(Throwable("failed when download image $handler, please restart the camera"))
+                                listenerCamera?.onStop()
+                                return@runBlocking
+                            }
+                            listenerCamera?.onImageDownloaded(objectImage)
+                        } else {
+                            session.log.d(TAG, "Skipping duplicate event: Filename=$name, CaptureDate=${info.captureDate}, Handler=$handler")
+                        }
                     } else {
-                        session.log.d(TAG, "Skipping handler: $handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix")
+                        session.log.d(TAG, "Skipping non-JPEG handler: $handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix")
                     }
                 }
             }

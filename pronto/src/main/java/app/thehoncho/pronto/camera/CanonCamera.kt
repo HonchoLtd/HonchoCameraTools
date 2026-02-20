@@ -74,19 +74,29 @@ class CanonCamera(
             val getStorageInfoCmd = GetStorageInfoCommand(session, storage)
             session.log.d(TAG, "Checking storage $storage with GetStorageInfoCommand")
             executor.handleCommand(getStorageInfoCmd)
-            session.log.d(TAG, "Executed GetStorageInfoCommand for $storage")
-            val storageInfoResult = getStorageInfoCmd.getResult()
-            session.log.d(TAG, "Result for $storage: $storageInfoResult")
-            storageInfoResult.onFailure {
-                session.log.e(TAG, "Failed to get storage info for $storage: ${it.message}")
-            }
-            storageInfoResult.getOrNull()?.let { info ->
-                session.log.d(TAG, "Storage $storage info: type=${info.storageType}, fsType=${info.filesystemType}, maxCapacity=${info.maxCapacity}, freeSpace=${info.freeSpaceInBytes}")
-                if (info.maxCapacity > 0) {
-                    validStorageIds.add(storage)
-                    session.log.d(TAG, "Storage $storage is valid with capacity ${info.maxCapacity}")
-                } else {
-                    session.log.e(TAG, "Storage $storage has maxCapacity=0, skipping")
+            when(getStorageInfoCmd.responseCode) {
+                PtpConstants.Response.Ok -> {
+                    session.log.d(TAG, "Executed GetStorageInfoCommand for $storage")
+                    val storageInfoResult = getStorageInfoCmd.getResult()
+                    session.log.d(TAG, "Result for $storage: $storageInfoResult")
+                    storageInfoResult.getOrNull()?.let { info ->
+                        session.log.d(TAG, "Storage $storage info: type=${info.storageType}, fsType=${info.filesystemType}, maxCapacity=${info.maxCapacity}, freeSpace=${info.freeSpaceInBytes}")
+                        if (info.maxCapacity > 0) {
+                            validStorageIds.add(storage)
+                            session.log.d(TAG, "Storage $storage is valid with capacity ${info.maxCapacity}")
+                        } else {
+                            session.log.e(TAG, "Storage $storage has maxCapacity=0, skipping")
+                        }
+                    }
+                }
+                PtpConstants.Response.StoreNotAvailable -> {
+                    session.log.w(TAG, "Storage Not Available id: $storage")
+                }
+                else -> {
+                    session.log.e(TAG, "Storage: Cannot populate storage, please check the storage")
+                    listenerCamera?.onError(Throwable("Cannot populate storage, please check the storage"))
+                    listenerCamera?.onStop()
+                    return@runBlocking
                 }
             }
         }

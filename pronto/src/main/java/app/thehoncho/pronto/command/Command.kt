@@ -8,7 +8,7 @@ import java.util.Locale
 
 abstract class Command(protected val session: Session): PTPAction {
     // protected var hasDataToSend = false
-    protected var responseCode: Short = 0
+    public var responseCode: Short = 0
     public var hasResponseReceived = false
 
     private val hasEventReceived = false
