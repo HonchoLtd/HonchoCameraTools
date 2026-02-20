@@ -98,24 +98,6 @@ class NikonCamera(
             if (!finishLoadStorageImage) {
                 session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
                 validStorageIds.forEach { storage ->
-                    session.log.d(TAG, "execute: get handlers with storage $storage")
-                    val getNumObjectsCommand = handlerCommandRetry(session, executor) {
-                        GetNumObjectsCommand(session, storage)
-                    }
-                    val latestTotalImages = getNumObjectsCommand.getResult().getOrDefault(0)
-                    session.log.d(TAG, "execute: Total objects: $latestTotalImages ")
-
-                    session.log.d(TAG, "execute: Total current=${currentTotalImageByStorage[storage]} latest=$latestTotalImages")
-
-                    if (latestTotalImages > 0 && currentTotalImageByStorage[storage] == latestTotalImages) {
-                        session.log.d(TAG, "execute: counts match for storage $storage, skipping handler query")
-                        currentTotalImageByStorage[storage] = latestTotalImages
-                        return@forEach
-                    } else {
-                        session.log.d(TAG, "execute: counts differ for storage $storage, updating and fetching handlers")
-                        currentTotalImageByStorage[storage] = latestTotalImages
-                    }
-
                     val getHandlersCommand = handlerCommandRetry(session,executor) {
                         GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
                     }
@@ -127,39 +109,52 @@ class NikonCamera(
                     val handlers = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
                     session.log.d(TAG, "execute: get handlers with total ${handlers.size} handlers on storage $storage")
 
-                    val handlerNotCache = handlers.filterNot { cacheImage.keys.contains(it) }
-                    session.log.d(TAG, "execute: get handlers with total ${handlerNotCache.size} handlers not cache on storage $storage")
-                    handlerNotCache.forEach { handler ->
-                        val getObjectInfo =  handlerCommandRetry(session,executor) {
-                            GetObjectInfoCommand(session, handler)
+                    val jpegInfos = mutableListOf<Pair<Int, ObjectInfo>>()
+
+                    handlers.forEach { handler ->
+                        val infoCmd = GetObjectInfoCommand(session, handler)
+                        executor.handleCommand(infoCmd)
+                        val info = infoCmd.getResult().getOrNull()
+
+                        val name = info?.filename?.uppercase() ?: ""
+                        val suffix = if (name.length >= 4) name.takeLast(4) else name
+
+                        // Always log the handler being processed
+                        session.log.d(TAG, "Processing handler=$handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix, Sequence=${info?.sequenceNumber}")
+
+                        // Log the full info object for debugging
+                        session.log.d(TAG, "Full ObjectInfo for handler=$handler: $info")
+
+                        if (info?.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
+                            (name.endsWith(".JPG") || name.endsWith(".JPEG")) &&
+                            !cacheImage.containsKey(handler)) {
+
+                            session.log.d(TAG, "Candidate JPEG handler: $handler, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
+                            jpegInfos.add(handler to info)
+                        } else {
+                            session.log.d(TAG, "Skipping handler: $handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix")
+                        }
+                    }
+                    // ✅ Add log before starting jpegInfos loop
+                    session.log.d(TAG, "Starting to loop jpegInfos with total ${jpegInfos.size} candidates")
+                    // Now process only the filtered JPEGs not already in cache
+                    jpegInfos.forEach { (handler, info) ->
+                        // Log handler and full info object before processing
+                        session.log.d(TAG, "Processing jpegInfos entry: Handler=$handler, Info=$info")
+                        val name = info.filename?.uppercase() ?: ""
+                        val suffix = if (name.length >= 4) name.takeLast(4) else name
+                        val alreadyCached = cacheImage.values.any {
+                            it.filename?.uppercase() == name
                         }
 
-                        getObjectInfo.getResult().onFailure {
-                            session.log.e(TAG, "execute: failed when get object info, please restart the camera. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
-                            listenerCamera?.onError(Throwable("failed when get object info $handler, please restart the camera"))
-                            listenerCamera?.onStop()
-                            return@runBlocking
-                        }
-                        getObjectInfo.getResult().getOrNull()?.let { info ->
-                            val name = info.filename?.uppercase() ?: ""
-                            if (info.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
-                                (name.endsWith(".JPG") || name.endsWith(".JPEG"))
-                            ) {
-                                // Check if filename + captureDate already exists in cache
-                                val alreadyCached = cacheImage.values.any {
-                                    it.filename?.uppercase() == name.uppercase() &&
-                                            it.captureDate == info.captureDate
-                                }
+                        // Log after duplicate check
+                        session.log.d(TAG, "Duplicate check result for Handler=$handler, Filename=$name, CaptureDate=${info.captureDate}, alreadyCached=$alreadyCached, Suffix=$suffix")
 
-                                if (!alreadyCached) {
-                                    cacheImage[handler] = info
-                                    session.log.d(TAG, "Cached JPEG object: $name (Handler: $handler, CaptureDate: ${info.captureDate})")
-                                } else {
-                                    session.log.d(TAG, "Skipping duplicate filename+date: $name (Handler: $handler, CaptureDate: ${info.captureDate})")
-                                }
-                            } else {
-                                session.log.d(TAG, "Skipping non-JPEG object: $name (Format: ${info.objectFormat})")
-                            }
+                        if (!alreadyCached) {
+                            cacheImage[handler] = info
+                            session.log.d(TAG, "Cached JPEG object: $name (Handler: $handler, CaptureDate=${info.captureDate}, Suffix=$suffix)")
+                        } else {
+                            session.log.d(TAG, "Skipping duplicate filename+date: $name (Handler: $handler, CaptureDate=${info.captureDate}, Suffix=$suffix)")
                         }
                     }
                 }
@@ -168,15 +163,19 @@ class NikonCamera(
                 val getCleanHandlers = listenerCamera?.onHandlersFilter(cacheImage.values.toList()) ?: listOf()
                 session.log.d(TAG, "execute: get handlers with total ${getCleanHandlers.size} handlers clean")
 
-                getCleanHandlers.forEach { handler ->
-                    val objectImage = onDownloadImage(executor, handler.handlerID)
+                getCleanHandlers.forEach { info ->
+                    val name = info.filename?.uppercase() ?: ""
+                    val suffix = if (name.length >= 4) name.takeLast(4) else name
+                    session.log.d(TAG, "Downloading handler: ${info.handlerID}, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
+
+                    val objectImage = onDownloadImage(executor, info.handlerID)
                     if (objectImage == null) {
-                        session.log.e(TAG, "execute: failed when download image $handler. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
-                        listenerCamera?.onError(Throwable("failed when download image $handler, please restart the camera"))
+                        session.log.e(TAG, "execute: failed when download image $name (Handler: ${info.handlerID}, CaptureDate=${info.captureDate}, Suffix=$suffix)")
+                        listenerCamera?.onError(Throwable("failed when download image $name, please restart the camera"))
                         listenerCamera?.onStop()
                         return@runBlocking
                     }
-                    objectImage.let { image -> listenerCamera?.onImageDownloaded(image) }
+                    listenerCamera?.onImageDownloaded(objectImage)
                 }
 
                 finishLoadStorageImage = true
@@ -194,14 +193,36 @@ class NikonCamera(
 
             getEventCommand.getResult().getOrNull()?.forEach {
                 if (it.code.toInt() == PtpConstants.Event.ObjectAdded) {
-                    val objectImage = onDownloadImage(executor, it.parameter)
-                    if (objectImage == null) {
-                        session.log.e(TAG, "execute: failed when download image $it.parameter")
-                        listenerCamera?.onError(Throwable("failed when download image $it.parameter, please restart the camera"))
-                        listenerCamera?.onStop()
-                        return@runBlocking
+                    val handler = it.parameter
+                    val infoCmd = GetObjectInfoCommand(session, it.parameter)
+                    executor.handleCommand(infoCmd)
+
+                    val info = infoCmd.getResult().getOrNull()
+
+                    val name = info?.filename?.uppercase() ?: ""
+                    val suffix = if (name.length >= 4) name.takeLast(4) else name
+
+                    // Always log the handler being processed
+                    session.log.d(TAG, "Processing handler=$handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix, Sequence=${info?.sequenceNumber}")
+
+                    // Log the full info object for debugging
+                    session.log.d(TAG, "Full ObjectInfo for handler=$handler: $info")
+
+                    if (info?.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
+                        (name.endsWith(".JPG") || name.endsWith(".JPEG"))) {
+                        session.log.d(TAG, "Candidate JPEG handler: $handler, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
+                        cacheImage[handler] = info
+                        val objectImage = onDownloadImage(executor, handler)
+                        if (objectImage == null) {
+                            session.log.e(TAG, "execute: failed when download image $it.parameter")
+                            listenerCamera?.onError(Throwable("failed when download image $it.parameter, please restart the camera"))
+                            listenerCamera?.onStop()
+                            return@runBlocking
+                        }
+                        objectImage.let { image -> listenerCamera?.onImageDownloaded(image) }
+                    } else {
+                        session.log.d(TAG, "Skipping handler: $handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix")
                     }
-                    objectImage.let { image -> listenerCamera?.onImageDownloaded(image) }
                 }
             }
         }
@@ -270,7 +291,7 @@ class NikonCamera(
     }
 
     private suspend fun downloadImagePartial(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
-        session.log.d(TAG, "downloadImagePartial: start download image $handler")
+//        session.log.d(TAG, "downloadImagePartial: start download image $handler")
         var offset = 0
         val totalBytes = objectInfo.objectCompressedSize
         val imageTotalBytes = ByteBuffer.allocate(totalBytes)
@@ -289,11 +310,11 @@ class NikonCamera(
                 GetObjectPartial(session, handler, finalOffset, finalSize)
             }
 
-            session.log.d(TAG, "downloadImagePartial: consume command")
+//            session.log.d(TAG, "downloadImagePartial: consume command")
             partialObjectCommand.getResult().onFailure {
                 session.log.w(TAG, "downloadImagePartial: failed when download partial image $handler")
             }
-            session.log.d(TAG, "downloadImagePartial: consume command done")
+//            session.log.d(TAG, "downloadImagePartial: consume command done")
 
             if (partialObjectCommand.getResult().getOrNull() == null) {
                 session.log.e(TAG, "downloadImagePartial: failed when download partial image")
@@ -303,7 +324,7 @@ class NikonCamera(
             val imageBytes = partialObjectCommand.getResult().getOrNull()?.clone() ?: return null
             imageTotalBytes.put(imageBytes, 0, imageBytes.size)
 
-            session.log.d(TAG, "downloadImagePartial: download with offset $offset with size $size")
+//            session.log.d(TAG, "downloadImagePartial: download with offset $offset with size $size")
             offset += size
 
             if (!worker.isRunning()) {
@@ -316,7 +337,7 @@ class NikonCamera(
         bitmapOptions.inSampleSize = 2
         val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, bitmapOptions)
 
-        session.log.d(TAG, "downloadImagePartial: finish download image")
+//        session.log.d(TAG, "downloadImagePartial: finish download image")
         return ObjectImage(objectInfo, handler, ImageObject(imageBytes, bitmap))
     }
 
