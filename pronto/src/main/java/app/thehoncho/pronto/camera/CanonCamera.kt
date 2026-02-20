@@ -152,8 +152,7 @@ class CanonCamera(
                         ) {
                             // Check if filename + captureDate already exists in cache
                             val alreadyCached = cacheImage.values.any {
-                                it.filename?.uppercase() == name.uppercase() &&
-                                        it.captureDate == info.captureDate
+                                it.filename?.uppercase() == name.uppercase()
                             }
 
                             if (!alreadyCached) {
