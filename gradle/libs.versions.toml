@@ -1,5 +1,6 @@
 [versions]
 agp = "8.13.0"
+exifinterface = "1.4.2"
 kotlin = "2.2.0"
 
 desugar = "2.1.5"
@@ -13,6 +14,7 @@ androidx-junit = "1.2.1"
 espresso = "3.6.1"
 
 [libraries]
+androidx-exifinterface = { module = "androidx.exifinterface:exifinterface", version.ref = "exifinterface" }
 desugar-jdk-libs = { module = "com.android.tools:desugar_jdk_libs", version.ref = "desugar" }
 core-ktx = { module = "androidx.core:core-ktx", version.ref = "core-ktx" }
 lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle-runtime" }

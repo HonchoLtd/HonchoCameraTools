@@ -1,6 +1,7 @@
 package app.thehoncho.pronto.camera
 
 import app.thehoncho.pronto.command.MultipleCommand
+import app.thehoncho.pronto.model.CachedImageEntry
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.model.ObjectImage
 import app.thehoncho.pronto.model.ObjectInfo
@@ -43,7 +44,7 @@ abstract class BaseCamera: MultipleCommand() {
         suspend fun onDeviceFailedToConnect(exception: Throwable)
         // call when the camera to filter the handler, handler return from this function will use
         // to download the image
-        suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo>
+        suspend fun onHandlersFilter(handlers: List<CachedImageEntry>): List<CachedImageEntry>
         // call when the image already downloaded from camera to the byte array
         // this will be called multiple time base on the return from onHandlersFilter
         suspend fun onImageDownloaded(objectImage: ObjectImage)

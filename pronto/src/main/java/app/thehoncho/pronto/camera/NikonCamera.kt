@@ -2,6 +2,7 @@ package app.thehoncho.pronto.camera
 
 import android.graphics.BitmapFactory
 import android.mtp.MtpConstants
+import androidx.exifinterface.media.ExifInterface
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.WorkerExecutor
 import app.thehoncho.pronto.command.Command
@@ -18,6 +19,7 @@ import app.thehoncho.pronto.command.general.GetStorageInfoCommand
 import app.thehoncho.pronto.command.general.OpenSessionCommand
 import app.thehoncho.pronto.command.nikon.NikonGetDevicePropCommand
 import app.thehoncho.pronto.command.nikon.NikonGetEventCommand
+import app.thehoncho.pronto.model.CachedImageEntry
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.model.ImageObject
 import app.thehoncho.pronto.model.ObjectImage
@@ -25,13 +27,17 @@ import app.thehoncho.pronto.model.ObjectInfo
 import app.thehoncho.pronto.utils.PtpConstants
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
+import kotlin.math.min
 
 class NikonCamera(
     private val session: Session
 ): BaseCamera() {
     private var isPartialSupport = false
-    private var cacheImage = mutableMapOf<Int, ObjectInfo>()
+//    private var cacheImage = mutableMapOf<Int, ObjectInfo>()
+    private var cacheImage = mutableMapOf<String, CachedImageEntry>() // Key = compositeKey
+
 
     override fun execute(executor: WorkerExecutor) = runBlocking {
         val deviceInfo = onConnecting(executor)
@@ -107,86 +113,136 @@ class NikonCamera(
             if (!finishLoadStorageImage) {
                 session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
                 validStorageIds.forEach { storage ->
-                    val getHandlersCommand = handlerCommandRetry(session,executor) {
+                    val getHandlersCommand = handlerCommandRetry(session, executor) {
                         GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
                     }
 
                     getHandlersCommand.getResult().onFailure {
-                        session.log.w(TAG, "execute: failed when get handlers, maybe the handler its empty")
+                        session.log.w(
+                            TAG,
+                            "execute: failed when get handlers, maybe the handler its empty"
+                        )
                     }
 
                     val handlers = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
-                    session.log.d(TAG, "execute: get handlers with total ${handlers.size} handlers on storage $storage")
+                    session.log.d(
+                        TAG,
+                        "execute: get handlers with total ${handlers.size} handlers on storage $storage"
+                    )
 
-                    val jpegInfos = mutableListOf<Pair<Int, ObjectInfo>>()
-
-                    handlers.forEach { handler ->
-                        val infoCmd = GetObjectInfoCommand(session, handler)
-                        executor.handleCommand(infoCmd)
-                        val info = infoCmd.getResult().getOrNull()
-
-                        val name = info?.filename?.uppercase() ?: ""
-                        val suffix = if (name.length >= 4) name.takeLast(4) else name
-
-                        // Always log the handler being processed
-                        session.log.d(TAG, "Processing handler=$handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix, Sequence=${info?.sequenceNumber}")
-
-                        // Log the full info object for debugging
-                        session.log.d(TAG, "Full ObjectInfo for handler=$handler: $info")
-
-                        if (info?.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
-                            (name.endsWith(".JPG") || name.endsWith(".JPEG")) &&
-                            !cacheImage.containsKey(handler)) {
-
-                            session.log.d(TAG, "Candidate JPEG handler: $handler, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
-                            jpegInfos.add(handler to info)
-                        } else {
-                            session.log.d(TAG, "Skipping handler: $handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix")
-                        }
+                    val handlerNotCache = handlers.filterNot { handlerId ->
+                        cacheImage.values.any { it.handlerId == handlerId }
                     }
-                    // ✅ Add log before starting jpegInfos loop
-                    session.log.d(TAG, "Starting to loop jpegInfos with total ${jpegInfos.size} candidates")
-                    // Now process only the filtered JPEGs not already in cache
-                    jpegInfos.forEach { (handler, info) ->
-                        // Log handler and full info object before processing
-                        session.log.d(TAG, "Processing jpegInfos entry: Handler=$handler, Info=$info")
-                        val name = info.filename?.uppercase() ?: ""
-                        val suffix = if (name.length >= 4) name.takeLast(4) else name
-                        val alreadyCached = cacheImage.values.any {
-                            it.filename?.uppercase() == name
+
+                    session.log.d(
+                        TAG,
+                        "execute: get handlers with total ${handlerNotCache.size} handlers not cache on storage $storage"
+                    )
+
+                    handlerNotCache.forEach { handler ->
+                        val getObjectInfo = handlerCommandRetry(session, executor) {
+                            GetObjectInfoCommand(session, handler)
                         }
+                        getObjectInfo.getResult().onFailure {
+                            session.log.e(TAG, "execute: failed when get object info, please restart the camera. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
+                            listenerCamera?.onError(Throwable("failed when get object info $handler, please restart the camera"))
+                            listenerCamera?.onStop()
+                            return@runBlocking
+                        }
+                        getObjectInfo.getResult().getOrNull()?.let { info ->
+                            val name = info.filename?.uppercase() ?: ""
 
-                        // Log after duplicate check
-                        session.log.d(TAG, "Duplicate check result for Handler=$handler, Filename=$name, CaptureDate=${info.captureDate}, alreadyCached=$alreadyCached, Suffix=$suffix")
+                            session.log.d(TAG, "Full ObjectInfo for handler=$handler: $info")
 
-                        if (!alreadyCached) {
-                            cacheImage[handler] = info
-                            session.log.d(TAG, "Cached JPEG object: $name (Handler: $handler, CaptureDate=${info.captureDate}, Suffix=$suffix)")
-                        } else {
-                            session.log.d(TAG, "Skipping duplicate filename+date: $name (Handler: $handler, CaptureDate=${info.captureDate}, Suffix=$suffix)")
+                            if (info.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
+                                (name.endsWith(".JPG") || name.endsWith(".JPEG"))
+                            ) {
+
+                                // ─────────────────────────────────────
+                                // PHASE 1: EXIF-Based Deduplication
+                                // ─────────────────────────────────────
+
+                                // 1. Fetch only partial bytes for EXIF parsing (64KB)
+                                val partialBytes = fetchPartialBytesForExif(executor, handler, info)
+
+                                // 2. Generate EXIF-based unique key from partial data
+                                val exifKey = if (partialBytes != null) {
+                                    generateExifUniqueKeyFromBytes(partialBytes, info)
+                                } else {
+                                    null // Fallback if partial fetch fails
+                                }
+
+                                // 3. Build composite unique key
+                                val compositeKey = generateCompositeUniqueKey(info, exifKey)
+
+                                // 4. Check if already cached (duplicate detection)
+                                if (cacheImage.containsKey(compositeKey)) {
+                                    session.log.d(
+                                        TAG,
+                                        "Skipping duplicate image with composite key: $compositeKey, Filename=$name"
+                                    )
+                                    return@let // ❌ Skip: already cached, don't add again
+                                }
+
+                                // 5. ✅ Unique: Add to cache as CachedImageEntry (metadata only, no image bytes yet)
+                                val entry = CachedImageEntry(info, compositeKey, info.handlerID)
+                                cacheImage[compositeKey] = entry
+
+                                session.log.d(
+                                    TAG,
+                                    "Cached unique image: $name with key: $compositeKey, handler: ${info.handlerID}"
+                                )
+                            } else {
+                                session.log.d(
+                                    TAG,
+                                    "Skipping non-JPEG object: $name, Format=${info.objectFormat}"
+                                )
+                            }
                         }
                     }
                 }
 
                 // val getCleanHandlers = onHandlersFilterCallback?.invoke(cacheImage.values.toList()) ?: listOf()
-                val getCleanHandlers = listenerCamera?.onHandlersFilter(cacheImage.values.toList()) ?: listOf()
-                session.log.d(TAG, "execute: get handlers with total ${getCleanHandlers.size} handlers clean")
+                val filteredEntries = listenerCamera?.onHandlersFilter(cacheImage.values.toList()) ?: listOf()
 
-                getCleanHandlers.forEach { info ->
-                    val name = info.filename?.uppercase() ?: ""
-                    val suffix = if (name.length >= 4) name.takeLast(4) else name
-                    session.log.d(TAG, "Downloading handler: ${info.handlerID}, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
+                val approvedCompositeKeys = filteredEntries.map { it.compositeKey }.toSet()
 
-                    val objectImage = onDownloadImage(executor, info.handlerID)
-                    if (objectImage == null) {
-                        session.log.e(TAG, "execute: failed when download image $name (Handler: ${info.handlerID}, CaptureDate=${info.captureDate}, Suffix=$suffix)")
-                        listenerCamera?.onError(Throwable("failed when download image $name, please restart the camera"))
-                        listenerCamera?.onStop()
-                        return@runBlocking
+                session.log.d(
+                    TAG,
+                    "Download phase: ${approvedCompositeKeys.size} approved entries, ${cacheImage.size} cached entries"
+                )
+
+                cacheImage.values.forEach { entry ->
+                    // 🔑 Critical: Check by compositeKey (content-based), BUKAN handlerID
+                    if (entry.compositeKey in approvedCompositeKeys) {
+                        val name = entry.objectInfo.filename?.uppercase() ?: ""
+                        val suffix = if (name.length >= 4) name.takeLast(4) else name
+
+                        session.log.d(
+                            TAG,
+                            "Downloading handler: ${entry.objectInfo.handlerID}, Filename=$name, " +
+                                    "CaptureDate=${entry.objectInfo.captureDate}, Suffix=$suffix, CompositeKey=${entry.compositeKey}"
+                        )
+
+                        // ✅ Download menggunakan handlerId dari entry (bukan dari filter result)
+                        val objectImage = onDownloadImage(executor, entry.handlerId)
+
+                        if (objectImage == null) {
+                            session.log.e(
+                                TAG,
+                                "execute: failed when download image $name (Handler: ${entry.objectInfo.handlerID}, " +
+                                        "CaptureDate=${entry.objectInfo.captureDate}, Suffix=$suffix)"
+                            )
+                            listenerCamera?.onError(Throwable("failed when download image $name, please restart the camera"))
+                            listenerCamera?.onStop()
+                            return@runBlocking
+                        }
+
+                        listenerCamera?.onImageDownloaded(objectImage)
+                    } else {
+                        session.log.d(TAG, "Skipped download (filtered out): ${entry.compositeKey}")
                     }
-                    listenerCamera?.onImageDownloaded(objectImage)
                 }
-
                 finishLoadStorageImage = true
             }
 
@@ -200,49 +256,71 @@ class NikonCamera(
                 return@runBlocking
             }
 
-            getEventCommand.getResult().getOrNull()?.forEach {
-                if (it.code.toInt() == PtpConstants.Event.ObjectAdded) {
-                    val handler = it.parameter
-                    val infoCmd = GetObjectInfoCommand(session, it.parameter)
+            getEventCommand.getResult().getOrNull()?.forEach { event ->
+                if (event.code.toInt() == PtpConstants.Event.ObjectAdded) {
+                    val handler = event.parameter
+
+                    // ✅ Quick pre-check: skip if handler already processed this session (optimization)
+                    if (cacheImage.values.any { it.handlerId == handler }) {
+                        session.log.d(TAG, "Skipping event handler already processed: $handler")
+                        return@forEach
+                    }
+
+                    val infoCmd = GetObjectInfoCommand(session, handler)
                     executor.handleCommand(infoCmd)
 
-                    val info = infoCmd.getResult().getOrNull()
-
-                    val name = info?.filename?.uppercase() ?: ""
+                    val info = infoCmd.getResult().getOrNull() ?: return@forEach
+                    val name = info.filename?.uppercase() ?: ""
                     val suffix = if (name.length >= 4) name.takeLast(4) else name
 
-                    // Always log the handler being processed
-                    session.log.d(TAG, "Processing handler=$handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix, Sequence=${info?.sequenceNumber}")
-
-                    // Log the full info object for debugging
+                    session.log.d(TAG, "Processing handler=$handler, Filename=$name, Format=${info.objectFormat}, CaptureDate=${info.captureDate}, Suffix=$suffix, Sequence=${info.sequenceNumber}")
                     session.log.d(TAG, "Full ObjectInfo for handler=$handler: $info")
 
-                    if (info?.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
+                    if (info.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
                         (name.endsWith(".JPG") || name.endsWith(".JPEG"))) {
+
                         session.log.d(TAG, "Candidate JPEG handler: $handler, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
 
-                        // ✅ Check if filename+captureDate already exists in cache
-                        val alreadyCached = cacheImage.values.any {
-                            it.filename?.uppercase() == name
-                        }
+                        // ─────────────────────────────────────
+                        // EXIF-Based Deduplication for Event (SAME as initial scan)
+                        // ─────────────────────────────────────
 
-                        if (!alreadyCached) {
-                            session.log.d(TAG, "Candidate JPEG handler: $handler, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
-                            cacheImage[handler] = info
+                        // 1. Fetch partial bytes for EXIF parsing (64KB)
+                        val partialBytes = fetchPartialBytesForExif(executor, handler, info)
 
-                            val objectImage = onDownloadImage(executor, handler)
-                            if (objectImage == null) {
-                                session.log.e(TAG, "execute: failed when download image $handler")
-                                listenerCamera?.onError(Throwable("failed when download image $handler, please restart the camera"))
-                                listenerCamera?.onStop()
-                                return@runBlocking
-                            }
-                            listenerCamera?.onImageDownloaded(objectImage)
+                        // 2. Generate EXIF-based unique key
+                        val exifKey = if (partialBytes != null) {
+                            generateExifUniqueKeyFromBytes(partialBytes, info)
                         } else {
-                            session.log.d(TAG, "Skipping duplicate event: Filename=$name, CaptureDate=${info.captureDate}, Handler=$handler")
+                            null // Fallback if partial fetch fails
                         }
+
+                        // 3. Build composite unique key (content-based, NO handlerID)
+                        val compositeKey = generateCompositeUniqueKey(info, exifKey)
+
+                        // 4. Check if already cached (duplicate detection by CONTENT)
+                        if (cacheImage.containsKey(compositeKey)) {
+                            session.log.d(TAG, "Skipping duplicate event with composite key: $compositeKey, Filename=$name, Suffix=$suffix")
+                            return@forEach // Skip: already cached
+                        }
+
+                        // 5. ✅ Unique: Add to cache as CachedImageEntry
+                        val entry = CachedImageEntry(info, compositeKey, info.handlerID)
+                        cacheImage[compositeKey] = entry
+
+                        session.log.d(TAG, "Cached unique image (event): $name with key: $compositeKey, handler: ${info.handlerID}, Suffix=$suffix")
+
+                        val objectImage = onDownloadImage(executor, handler)
+                        if (objectImage == null) {
+                            session.log.e(TAG, "execute: failed when download image $handler")
+                            listenerCamera?.onError(Throwable("failed when download image $handler, please restart the camera"))
+                            listenerCamera?.onStop()
+                            return@runBlocking
+                        }
+                        listenerCamera?.onImageDownloaded(objectImage)
+
                     } else {
-                        session.log.d(TAG, "Skipping non-JPEG handler: $handler, Filename=$name, Format=${info?.objectFormat}, CaptureDate=${info?.captureDate}, Suffix=$suffix")
+                        session.log.d(TAG, "Skipping non-JPEG handler: $handler, Filename=$name, Format=${info.objectFormat}, CaptureDate=${info.captureDate}, Suffix=$suffix")
                     }
                 }
             }
@@ -373,6 +451,63 @@ class NikonCamera(
             delay(500L)
         }
         error("Worker is shutting down")
+    }
+
+    private suspend fun fetchPartialBytesForExif(
+        worker: WorkerExecutor,
+        handler: Int,
+        objectInfo: ObjectInfo
+    ): ByteArray? {
+        return try {
+            val fetchSize = min(64 * 1024, objectInfo.objectCompressedSize)
+            val partialCmd = handlerCommandRetry(session, worker) {
+                GetObjectPartial(session, handler, 0, fetchSize)
+            }
+            partialCmd.getResult().getOrNull()
+        } catch (e: Exception) {
+            session.log.w(TAG, "Failed to fetch partial bytes for EXIF: handler=$handler", e)
+            null
+        }
+    }
+
+    private fun generateCompositeUniqueKey(objectInfo: ObjectInfo, exifUniqueKey: String?): String {
+        val safeExifKey = exifUniqueKey ?: run {
+            // Fallback: hash of immutable fields if EXIF fails
+            "${objectInfo.filename}_${objectInfo.objectCompressedSize}_${objectInfo.captureDate}".hashCode()
+                .toString(16)
+        }
+        // ✅ Content-only key (no handlerID) - survives reconnects
+        return "${objectInfo.storageId}-${objectInfo.parentObject}-$safeExifKey"
+    }
+
+    private fun generateExifUniqueKeyFromBytes(partialBytes: ByteArray, objectInfo: ObjectInfo): String? {
+        return try {
+            val exif = ExifInterface(ByteArrayInputStream(partialBytes))
+
+            val dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+                ?: ""
+
+            // Sub-second precision for burst shots
+            val subSec = exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_ORIGINAL)
+                ?: exif.getAttribute("SubSecTimeOriginal")
+                ?: exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_DIGITIZED)
+                ?: exif.getAttribute("SubSecTimeDigitized")
+                ?: ""
+
+            val make = exif.getAttribute(ExifInterface.TAG_MAKE) ?: ""
+            val model = exif.getAttribute(ExifInterface.TAG_MODEL) ?: ""
+            val uniqueId = exif.getAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID)
+                ?: exif.getAttribute("ImageUniqueID")
+                ?: ""
+
+            // Deterministic hash
+            val rawKey = "$dateTime|$subSec|$uniqueId|$make|$model|${objectInfo.objectCompressedSize}"
+            rawKey.hashCode().toString(16)
+        } catch (e: Exception) {
+            session.log.w(TAG, "EXIF parse failed for handler ${objectInfo.handlerID}", e)
+            null
+        }
     }
 
     companion object {

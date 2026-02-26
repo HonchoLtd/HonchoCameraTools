@@ -27,6 +27,7 @@ import app.thehoncho.pronto.camera.BaseCamera
 import app.thehoncho.pronto.camera.CanonCamera
 import app.thehoncho.pronto.camera.NikonCamera
 import app.thehoncho.pronto.camera.SonyCamera
+import app.thehoncho.pronto.model.CachedImageEntry
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.model.ObjectImage
 import app.thehoncho.pronto.model.ObjectInfo
@@ -120,7 +121,7 @@ class CameraWorker(
                             // no need to force close, cause it will be trigger onStop after this
                         }
 
-                        override suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo> {
+                        override suspend fun onHandlersFilter(handlers: List<CachedImageEntry>): List<CachedImageEntry> {
                             logger.d(TAG, "onHandlersFilter: ${handlers.size}")
                             return handlers.lastOrNull()?.let { listOf(it) } ?: listOf()
                         }
@@ -162,7 +163,7 @@ class CameraWorker(
                             // no need to force close, cause it will be trigger onStop after this
                         }
 
-                        override suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo> {
+                        override suspend fun onHandlersFilter(handlers: List<CachedImageEntry>): List<CachedImageEntry> {
                             // Sony never use this
                             return emptyList()
                         }
@@ -203,7 +204,7 @@ class CameraWorker(
                             // no need to force close, cause it will be trigger onStop after this
                         }
 
-                        override suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo> {
+                        override suspend fun onHandlersFilter(handlers: List<CachedImageEntry>): List<CachedImageEntry> {
                             logger.d(TAG, "onHandlersFilter: ${handlers.size}")
                             return handlers.lastOrNull()?.let { listOf(it) } ?: listOf()
                         }
