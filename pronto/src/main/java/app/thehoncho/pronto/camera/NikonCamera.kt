@@ -36,6 +36,9 @@ class NikonCamera(
 ): BaseCamera() {
     private var isPartialSupport = false
 //    private var cacheImage = mutableMapOf<Int, ObjectInfo>()
+
+    // Volatile session exclusion list for O(1) duplicate skip
+    private var sessionExclusionList = mutableSetOf<String>() // Format: "handlerId::parentId"
     private var cacheImage = mutableMapOf<String, CachedImageEntry>() // Key = compositeKey
 
 
@@ -109,6 +112,10 @@ class NikonCamera(
             }
         }
 
+        // Reset exclusion list at start of each session (camera connect)
+        sessionExclusionList.clear()
+        session.log.d(TAG, "Session exclusion list reset for new camera connection")
+
         while (executor.isRunning()) {
             if (!finishLoadStorageImage) {
                 session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
@@ -162,6 +169,13 @@ class NikonCamera(
                                 // PHASE 1: EXIF-Based Deduplication
                                 // ─────────────────────────────────────
 
+                                // Check exclusion list BEFORE fetching partial bytes
+                                val exclusionKey = "${handler}::${info.parentObject}"
+                                if (exclusionKey in sessionExclusionList) {
+                                    session.log.d(TAG, "Handler $handler already processed this session; skipping EXIF fetch")
+                                    return@let
+                                }
+
                                 // 1. Fetch only partial bytes for EXIF parsing (64KB)
                                 val partialBytes = fetchPartialBytesForExif(executor, handler, info)
 
@@ -181,6 +195,8 @@ class NikonCamera(
                                         TAG,
                                         "Skipping duplicate image with composite key: $compositeKey, Filename=$name"
                                     )
+                                    // Mark as processed in exclusion list even if duplicate
+                                    sessionExclusionList.add(exclusionKey)
                                     return@let // ❌ Skip: already cached, don't add again
                                 }
 
@@ -192,6 +208,11 @@ class NikonCamera(
                                     TAG,
                                     "Cached unique image: $name with key: $compositeKey, handler: ${info.handlerID}"
                                 )
+
+                                // Mark as processed in exclusion list after successful caching
+                                sessionExclusionList.add(exclusionKey)
+                                session.log.d(TAG, "Added to exclusion list: $exclusionKey (cached unique)")
+
                             } else {
                                 session.log.d(
                                     TAG,
@@ -285,6 +306,13 @@ class NikonCamera(
                         // EXIF-Based Deduplication for Event (SAME as initial scan)
                         // ─────────────────────────────────────
 
+                        // Check exclusion list BEFORE fetching partial bytes
+                        val exclusionKey = "${handler}::${info.parentObject}"
+                        if (exclusionKey in sessionExclusionList) {
+                            session.log.d(TAG, "Event handler $handler already processed this session; skipping EXIF fetch")
+                            return@forEach
+                        }
+
                         // 1. Fetch partial bytes for EXIF parsing (64KB)
                         val partialBytes = fetchPartialBytesForExif(executor, handler, info)
 
@@ -301,6 +329,8 @@ class NikonCamera(
                         // 4. Check if already cached (duplicate detection by CONTENT)
                         if (cacheImage.containsKey(compositeKey)) {
                             session.log.d(TAG, "Skipping duplicate event with composite key: $compositeKey, Filename=$name, Suffix=$suffix")
+                            // Mark as processed in exclusion list
+                            sessionExclusionList.add(exclusionKey)
                             return@forEach // Skip: already cached
                         }
 
@@ -309,6 +339,9 @@ class NikonCamera(
                         cacheImage[compositeKey] = entry
 
                         session.log.d(TAG, "Cached unique image (event): $name with key: $compositeKey, handler: ${info.handlerID}, Suffix=$suffix")
+
+                        // Mark as processed in exclusion list
+                        sessionExclusionList.add(exclusionKey)
 
                         val objectImage = onDownloadImage(executor, handler)
                         if (objectImage == null) {
@@ -459,6 +492,12 @@ class NikonCamera(
         objectInfo: ObjectInfo
     ): ByteArray? {
         return try {
+            // Minimum size check before EXIF parsing attempt
+            if (objectInfo.objectCompressedSize < 128) {
+                session.log.w(TAG, "File too small for EXIF: handler=$handler, size=${objectInfo.objectCompressedSize}")
+                return null
+            }
+
             val fetchSize = min(64 * 1024, objectInfo.objectCompressedSize)
             val partialCmd = handlerCommandRetry(session, worker) {
                 GetObjectPartial(session, handler, 0, fetchSize)
@@ -472,16 +511,27 @@ class NikonCamera(
 
     private fun generateCompositeUniqueKey(objectInfo: ObjectInfo, exifUniqueKey: String?): String {
         val safeExifKey = exifUniqueKey ?: run {
-            // Fallback: hash of immutable fields if EXIF fails
-            "${objectInfo.filename}_${objectInfo.objectCompressedSize}_${objectInfo.captureDate}".hashCode()
-                .toString(16)
+            // Log warning when falling back to unreliable fields
+            session.log.w(
+                TAG,
+                "EXIF extraction failed for handler ${objectInfo.handlerID}; using fallback key (filename/size/date). Risk: false unique."
+            )
+            // Use unsigned hex for fallback too
+            "${objectInfo.filename}_${objectInfo.objectCompressedSize}_${objectInfo.captureDate}"
+                .hashCode().toUnsignedHex()
         }
-        // ✅ Content-only key (no handlerID) - survives reconnects
-        return "${objectInfo.storageId}-${objectInfo.parentObject}-$safeExifKey"
+        //  Use '::' delimiter to avoid collision with hash content
+        return "${objectInfo.storageId}::${objectInfo.parentObject}::$safeExifKey"
     }
 
     private fun generateExifUniqueKeyFromBytes(partialBytes: ByteArray, objectInfo: ObjectInfo): String? {
         return try {
+            // Minimum byte check before parsing
+            if (partialBytes.size < 128) {
+                session.log.w(TAG, "Partial bytes too small for EXIF parsing: ${partialBytes.size}")
+                return null
+            }
+
             val exif = ExifInterface(ByteArrayInputStream(partialBytes))
 
             val dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
@@ -509,6 +559,8 @@ class NikonCamera(
             null
         }
     }
+
+    private fun Int.toUnsignedHex(): String = this.toUInt().toString(16)
 
     companion object {
         private const val TAG = "NikonCamera"

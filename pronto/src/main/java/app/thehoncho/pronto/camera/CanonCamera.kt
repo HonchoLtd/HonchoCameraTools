@@ -37,6 +37,9 @@ class CanonCamera(
 
     // OLD:
     // private var cacheImage = mutableMapOf<Int, ObjectInfo>()
+
+    // Volatile session exclusion list for O(1) duplicate skip
+    private var sessionExclusionList = mutableSetOf<String>() // Format: "handlerId_parentId"
     private var cacheImage = mutableMapOf<String, CachedImageEntry>() // Key = compositeKey
 //    // Cache: composite key → ObjectInfo (metadata only, no image bytes)
 //    private var cacheImage = mutableMapOf<String, ObjectInfo>()
@@ -127,6 +130,9 @@ class CanonCamera(
             }
         }
 
+        sessionExclusionList.clear()
+        session.log.d(TAG, "Session exclusion list reset for new camera connection")
+
         val currentTotalImageByStorage = mutableMapOf<Int, Int>()
         while (executor.isRunning()) {
             session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
@@ -201,6 +207,13 @@ class CanonCamera(
                             // PHASE 1: Scan & Deduplicate (NO full download)
                             // ─────────────────────────────────────
 
+                            // Check exclusion list BEFORE fetching partial bytes
+                            val exclusionKey = "${handler}::${info.parentObject}"
+                            if (exclusionKey in sessionExclusionList) {
+                                session.log.d(TAG, "Handler $handler already processed this session; skipping EXIF fetch")
+                                return@let // Skip to next handler
+                            }
+
                             // 1. Fetch only partial bytes for EXIF parsing
                             val partialBytes = fetchPartialBytesForExif(executor, handler, info)
 
@@ -220,6 +233,8 @@ class CanonCamera(
                                     TAG,
                                     "Skipping duplicate image with composite key: $compositeKey"
                                 )
+                                // Mark as processed in exclusion list even if duplicate
+                                sessionExclusionList.add(exclusionKey)
                                 return@let // ❌ Skip: already cached, don't add again
                             }
 
@@ -232,10 +247,8 @@ class CanonCamera(
                                 "Cached unique image: $name with key: $compositeKey, handler: ${info.handlerID}"
                             )
 
-                            session.log.d(
-                                TAG,
-                                "Cached unique image metadata: $name with key: $compositeKey"
-                            )
+                            // Mark as processed in exclusion list after successful caching
+                            sessionExclusionList.add(exclusionKey)
                         } else {
                             session.log.d(TAG, "Skipping non-JPEG object: $name")
                         }
@@ -260,7 +273,11 @@ class CanonCamera(
                     session.log.d(TAG, "execute getCleanHandlers: flush before download image")
 
                     val objectImage = onDownloadImage(executor, entry.handlerId)
-                    if (objectImage == null) {
+
+                    // ✅ Attach CachedImageEntry to ObjectImage
+                    val enrichedImage = objectImage?.copy(cachedEntry = entry)
+                    // ✅ Check enrichedImage directly (cleaner flow)
+                    if (enrichedImage == null) {
                         session.log.e(
                             TAG,
                             "execute: failed when download image ${entry.objectInfo.filename}"
@@ -269,7 +286,9 @@ class CanonCamera(
                         listenerCamera?.onStop()
                         return@runBlocking
                     }
-                    objectImage.let { image -> listenerCamera?.onImageDownloaded(image) }
+
+                    // ✅ Pass enriched image to listener
+                    listenerCamera?.onImageDownloaded(enrichedImage)
                 }
             }
         }
@@ -421,13 +440,16 @@ class CanonCamera(
         objectInfo: ObjectInfo
     ): ByteArray? {
         return try {
-            // EXIF data is typically in the first 64KB of JPEG files
-            val fetchSize = min(64 * 1024, objectInfo.objectCompressedSize)
+            // ➕ ADDED: Minimum size check before EXIF parsing attempt
+            if (objectInfo.objectCompressedSize < 128) {
+                session.log.w(TAG, "File too small for EXIF: handler=$handler, size=${objectInfo.objectCompressedSize}")
+                return null
+            }
 
+            val fetchSize = min(64 * 1024, objectInfo.objectCompressedSize)
             val partialCmd = handlerCommandRetry(session, worker) {
                 GetObjectPartial(session, handler, 0, fetchSize)
             }
-
             partialCmd.getResult().getOrNull()
         } catch (e: Exception) {
             session.log.w(TAG, "Failed to fetch partial bytes for EXIF: handler=$handler", e)
@@ -435,193 +457,29 @@ class CanonCamera(
         }
     }
 
+
     private fun generateCompositeUniqueKey(objectInfo: ObjectInfo, exifUniqueKey: String?): String {
         val safeExifKey = exifUniqueKey ?: run {
-            // Fallback: hash of immutable fields if EXIF fails
-            "${objectInfo.filename}_${objectInfo.objectCompressedSize}_${objectInfo.captureDate}".hashCode()
-                .toString(16)
+            session.log.w(
+                TAG,
+                "EXIF extraction failed for handler ${objectInfo.handlerID}; using fallback key (filename/size/date). Risk: false unique."
+            )
+            // Use unsigned hex for fallback too
+            "${objectInfo.filename}_${objectInfo.objectCompressedSize}_${objectInfo.captureDate}"
+                .hashCode().toUnsignedHex()
         }
-        return "${objectInfo.storageId}-${objectInfo.parentObject}-$safeExifKey"
+        // Use '::' delimiter to avoid collision with hash content
+        return "${objectInfo.storageId}::${objectInfo.parentObject}::$safeExifKey"
     }
-
-//    private fun generateExifUniqueKeyFromBytes(
-//        partialBytes: ByteArray,
-//        objectInfo: ObjectInfo
-//    ): String? {
-//        return try {
-//            val exif = ExifInterface(ByteArrayInputStream(partialBytes))
-//
-//
-//            val subSecTime = exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME) ?: ""
-//            val imageUniqueId = exif.getAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID) ?: ""
-//
-//            // === DEVICE INFO ===
-//            val make = exif.getAttribute(ExifInterface.TAG_MAKE) ?: ""
-//            val model = exif.getAttribute(ExifInterface.TAG_MODEL) ?: ""
-//            val lensMake = exif.getAttribute(ExifInterface.TAG_LENS_MAKE) ?: ""
-//            val lensModel = exif.getAttribute(ExifInterface.TAG_LENS_MODEL) ?: ""
-//            val software = exif.getAttribute(ExifInterface.TAG_SOFTWARE) ?: ""
-//            val artist = exif.getAttribute(ExifInterface.TAG_ARTIST) ?: ""
-//            val copyright = exif.getAttribute(ExifInterface.TAG_COPYRIGHT) ?: ""
-//
-//            // === EXPOSURE & CAMERA SETTINGS ===
-//            val fNumber = exif.getAttribute(ExifInterface.TAG_F_NUMBER) ?: ""
-//            val exposureTime = exif.getAttribute(ExifInterface.TAG_EXPOSURE_TIME) ?: ""
-//            val iso = exif.getAttribute(ExifInterface.TAG_ISO_SPEED_RATINGS) ?: ""
-//            val focalLength = exif.getAttribute(ExifInterface.TAG_FOCAL_LENGTH) ?: ""
-//            val focalLengthIn35mm =
-//                exif.getAttribute(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM) ?: ""
-//            val flash = exif.getAttribute(ExifInterface.TAG_FLASH) ?: ""
-//            val flashEnergy = exif.getAttribute(ExifInterface.TAG_FLASH_ENERGY) ?: ""
-//            val whiteBalance = exif.getAttribute(ExifInterface.TAG_WHITE_BALANCE) ?: ""
-//            val exposureProgram = exif.getAttribute(ExifInterface.TAG_EXPOSURE_PROGRAM) ?: ""
-//            val meteringMode = exif.getAttribute(ExifInterface.TAG_METERING_MODE) ?: ""
-//            val exposureBias = exif.getAttribute(ExifInterface.TAG_EXPOSURE_BIAS_VALUE) ?: ""
-//            val maxApertureValue = exif.getAttribute(ExifInterface.TAG_MAX_APERTURE_VALUE) ?: ""
-//            val subjectDistance = exif.getAttribute(ExifInterface.TAG_SUBJECT_DISTANCE) ?: ""
-//            val sensingMethod = exif.getAttribute(ExifInterface.TAG_SENSING_METHOD) ?: ""
-//            val sceneCaptureType = exif.getAttribute(ExifInterface.TAG_SCENE_CAPTURE_TYPE) ?: ""
-//            val gainControl = exif.getAttribute(ExifInterface.TAG_GAIN_CONTROL) ?: ""
-//            val contrast = exif.getAttribute(ExifInterface.TAG_CONTRAST) ?: ""
-//            val saturation = exif.getAttribute(ExifInterface.TAG_SATURATION) ?: ""
-//            val sharpness = exif.getAttribute(ExifInterface.TAG_SHARPNESS) ?: ""
-//            val subjectDistanceRange =
-//                exif.getAttribute(ExifInterface.TAG_SUBJECT_DISTANCE_RANGE) ?: ""
-//
-//            // === IMAGE PROPERTIES ===
-//            val pixelX = exif.getAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION) ?: ""
-//            val pixelY = exif.getAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION) ?: ""
-//            val orientation = exif.getAttribute(ExifInterface.TAG_ORIENTATION) ?: ""
-//            val xResolution = exif.getAttribute(ExifInterface.TAG_X_RESOLUTION) ?: ""
-//            val yResolution = exif.getAttribute(ExifInterface.TAG_Y_RESOLUTION) ?: ""
-//            val resolutionUnit = exif.getAttribute(ExifInterface.TAG_RESOLUTION_UNIT) ?: ""
-//            val colorSpace = exif.getAttribute(ExifInterface.TAG_COLOR_SPACE) ?: ""
-//            val componentsConfig =
-//                exif.getAttribute(ExifInterface.TAG_COMPONENTS_CONFIGURATION) ?: ""
-//            val compressedBitsPerPixel =
-//                exif.getAttribute(ExifInterface.TAG_COMPRESSED_BITS_PER_PIXEL) ?: ""
-//            val imageDescription = exif.getAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION) ?: ""
-//            val userComment = exif.getAttribute(ExifInterface.TAG_USER_COMMENT) ?: ""
-//            val imageWidth = exif.getAttribute(ExifInterface.TAG_IMAGE_WIDTH) ?: ""
-//            val imageLength = exif.getAttribute(ExifInterface.TAG_IMAGE_LENGTH) ?: ""
-//
-//            // === GPS DATA (sanitize for logging) ===
-//            val gpsLat = exif.getAttribute(ExifInterface.TAG_GPS_LATITUDE) ?: ""
-//            val gpsLatRef = exif.getAttribute(ExifInterface.TAG_GPS_LATITUDE_REF) ?: ""
-//            val gpsLon = exif.getAttribute(ExifInterface.TAG_GPS_LONGITUDE) ?: ""
-//            val gpsLonRef = exif.getAttribute(ExifInterface.TAG_GPS_LONGITUDE_REF) ?: ""
-//            val gpsAltitude = exif.getAttribute(ExifInterface.TAG_GPS_ALTITUDE) ?: ""
-//            val gpsAltitudeRef = exif.getAttribute(ExifInterface.TAG_GPS_ALTITUDE_REF) ?: ""
-//            val gpsTimeStamp = exif.getAttribute(ExifInterface.TAG_GPS_TIMESTAMP) ?: ""
-//            val gpsDateStamp = exif.getAttribute(ExifInterface.TAG_GPS_DATESTAMP) ?: ""
-//            val gpsProcessingMethod =
-//                exif.getAttribute(ExifInterface.TAG_GPS_PROCESSING_METHOD) ?: ""
-//            val gpsAreaInformation = exif.getAttribute(ExifInterface.TAG_GPS_AREA_INFORMATION) ?: ""
-//            val gpsDifferential = exif.getAttribute(ExifInterface.TAG_GPS_DIFFERENTIAL) ?: ""
-//            val gpsSpeedRef = exif.getAttribute(ExifInterface.TAG_GPS_SPEED_REF) ?: ""
-//            val gpsSpeed = exif.getAttribute(ExifInterface.TAG_GPS_SPEED) ?: ""
-//            val gpsTrackRef = exif.getAttribute(ExifInterface.TAG_GPS_TRACK_REF) ?: ""
-//            val gpsTrack = exif.getAttribute(ExifInterface.TAG_GPS_TRACK) ?: ""
-//            val gpsImgDirectionRef =
-//                exif.getAttribute(ExifInterface.TAG_GPS_IMG_DIRECTION_REF) ?: ""
-//            val gpsImgDirection = exif.getAttribute(ExifInterface.TAG_GPS_IMG_DIRECTION) ?: ""
-//            val gpsDestLat = exif.getAttribute(ExifInterface.TAG_GPS_DEST_LATITUDE) ?: ""
-//            val gpsDestLon = exif.getAttribute(ExifInterface.TAG_GPS_DEST_LONGITUDE) ?: ""
-//
-////            val logLines = listOf(
-////                // Timestamps
-////                "dateTimeOriginal: $dateTimeOriginal",
-////                "dateTimeDigitized: $dateTimeDigitized",
-////                "dateTime: $dateTime",
-////                "subSecOriginal: $subSecOriginal",
-////                "subSecDigitized: $subSecDigitized",
-////                "subSecTime: $subSecTime",
-////                "imageUniqueId: $imageUniqueId",
-////
-////                // Device
-////                "make: $make",
-////                "model: $model",
-////                "lensMake: $lensMake",
-////                "lensModel: $lensModel",
-////                "software: $software",
-////                "artist: $artist",
-////                "copyright: $copyright",
-////
-////                // Exposure
-////                "fNumber: $fNumber",
-////                "exposureTime: $exposureTime",
-////                "iso: $iso",
-////                "focalLength: $focalLength",
-////                "focalLengthIn35mm: $focalLengthIn35mm",
-////                "flash: $flash",
-////                "flashEnergy: $flashEnergy",
-////                "whiteBalance: $whiteBalance",
-////                "exposureProgram: $exposureProgram",
-////                "meteringMode: $meteringMode",
-////                "exposureBias: $exposureBias",
-////                "maxApertureValue: $maxApertureValue",
-////                "subjectDistance: $subjectDistance",
-////                "sensingMethod: $sensingMethod",
-////                "sceneCaptureType: $sceneCaptureType",
-////                "gainControl: $gainControl",
-////                "contrast: $contrast",
-////                "saturation: $saturation",
-////                "sharpness: $sharpness",
-////                "subjectDistanceRange: $subjectDistanceRange",
-////
-////                // Image props
-////                "pixelX: $pixelX",
-////                "pixelY: $pixelY",
-////                "orientation: $orientation",
-////                "xResolution: $xResolution",
-////                "yResolution: $yResolution",
-////                "resolutionUnit: $resolutionUnit",
-////                "colorSpace: $colorSpace",
-////                "componentsConfig: $componentsConfig",
-////                "compressedBitsPerPixel: $compressedBitsPerPixel",
-////                "imageDescription: $imageDescription",
-////                "userComment: ${userComment.take(100)}", // Truncate long comments
-////                "imageWidth: $imageWidth",
-////                "imageLength: $imageLength",
-////
-////                // GPS (sanitized - hash raw coords if needed for privacy)
-////                "gpsLat: ${if (gpsLat.isNotEmpty()) gpsLat.hashCode().toString(16).take(8) else ""}",
-////                "gpsLatRef: $gpsLatRef",
-////                "gpsLon: ${if (gpsLon.isNotEmpty()) gpsLon.hashCode().toString(16).take(8) else ""}",
-////                "gpsLonRef: $gpsLonRef",
-////                "gpsAltitude: $gpsAltitude",
-////                "gpsAltitudeRef: $gpsAltitudeRef",
-////                "gpsTimeStamp: $gpsTimeStamp",
-////                "gpsDateStamp: $gpsDateStamp",
-////                "gpsProcessingMethod: $gpsProcessingMethod",
-////                "gpsAreaInformation: $gpsAreaInformation",
-////                "gpsDifferential: $gpsDifferential",
-////                "gpsSpeedRef: $gpsSpeedRef",
-////                "gpsSpeed: $gpsSpeed",
-////                "gpsTrackRef: $gpsTrackRef",
-////                "gpsTrack: $gpsTrack",
-////                "gpsImgDirectionRef: $gpsImgDirectionRef",
-////                "gpsImgDirection: $gpsImgDirection",
-////                "gpsDestLat: ${if (gpsDestLat.isNotEmpty()) gpsDestLat.hashCode().toString(16).take(8) else ""}",
-////                "gpsDestLon: ${if (gpsDestLon.isNotEmpty()) gpsDestLon.hashCode().toString(16).take(8) else ""}"
-////            )
-////            session.log.d(TAG, "=== EXIF DEBUG [handler: ${objectInfo.handlerID}] ===\n" + logLines.joinToString("\n"))
-//
-//            // === BUILD UNIQUE KEY (prioritize high-entropy fields) ===
-//            val primaryKey = imageUniqueId.ifEmpty {
-//                "$dateTimeOriginal$subSecOriginal|$make|$model|$fNumber|$exposureTime|$iso|$focalLength"
-//            }
-//
-//            session.log.d(TAG, "Generated unique key for ${objectInfo.handlerID}: $primaryKey or $imageUniqueId")
-//            primaryKey
-//        } catch (e: Exception) {
-//            session.log.w(TAG, "EXIF parse failed for handler ${objectInfo.handlerID}", e)
-//            return null
-//        }
-//    }
 
     private fun generateExifUniqueKeyFromBytes(partialBytes: ByteArray, objectInfo: ObjectInfo): String? {
         return try {
+            // Minimum byte check before parsing
+            if (partialBytes.size < 128) {
+                session.log.w(TAG, "Partial bytes too small for EXIF parsing: ${partialBytes.size}")
+                return null
+            }
+
             val exif = ExifInterface(ByteArrayInputStream(partialBytes))
 
             val dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
@@ -642,13 +500,17 @@ class CanonCamera(
                 ?: ""
 
             // Deterministic hash with sub-second + unique ID
-            val rawKey = "$dateTime|$subSec|$uniqueId|$make|$model|${objectInfo.objectCompressedSize}"
-            rawKey.hashCode().toString(16)
+            val rawKey = "$dateTime-$subSec-$uniqueId-$make-$model-${objectInfo.objectCompressedSize}"
+            // Use unsigned hex to avoid negative hash values
+            rawKey.hashCode().toUnsignedHex()
         } catch (e: Exception) {
             session.log.w(TAG, "EXIF parse failed for handler ${objectInfo.handlerID}", e)
-            null
+            null // → Triggers fail-safe fallback
         }
     }
+
+    private fun Int.toUnsignedHex(): String = this.toUInt().toString(16)
+
     companion object {
         private const val TAG = "CanonCamera"
     }
