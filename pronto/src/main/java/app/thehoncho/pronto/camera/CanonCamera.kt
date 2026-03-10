@@ -21,6 +21,7 @@ import app.thehoncho.pronto.command.general.OpenSessionCommand
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.model.ImageObject
 import app.thehoncho.pronto.model.ObjectImage
+import app.thehoncho.pronto.model.ObjectImageWithExif
 import app.thehoncho.pronto.model.ObjectInfo
 import app.thehoncho.pronto.utils.PtpConstants
 import kotlinx.coroutines.delay
@@ -28,24 +29,19 @@ import kotlinx.coroutines.runBlocking
 import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
 import kotlin.math.min
-import app.thehoncho.pronto.model.CachedImageEntry
 
 class CanonCamera(
     private val session: Session
 ): BaseCamera() {
     private var isPartialSupport = false
 
-    // OLD:
-    // private var cacheImage = mutableMapOf<Int, ObjectInfo>()
-
-    // Volatile session exclusion list for O(1) duplicate skip
-    private var sessionExclusionList = mutableSetOf<String>() // Format: "handlerId_parentId"
-    private var cacheImage = mutableMapOf<String, CachedImageEntry>() // Key = compositeKey
-//    // Cache: composite key → ObjectInfo (metadata only, no image bytes)
-//    private var cacheImage = mutableMapOf<String, ObjectInfo>()
-//
-//    // Reverse lookup: handlerID → composite key (for download phase)
-//    private var handlerToCompositeKey = mutableMapOf<Int, String>()
+    // In-memory deduplication sets
+    private val localRawDatabase = mutableSetOf<Int>()
+    private val processedHandlerIds = mutableSetOf<Int>()
+    private val localExifDatabaseExist = mutableSetOf<String>()
+    private val localExifDatabaseNotFound = mutableSetOf<String>()
+    private var isSkipAutoUpload = true
+    private var finishLoadStorageImage = false
 
     override fun execute(executor: WorkerExecutor) = runBlocking {
         val deviceInfo = onConnecting(executor)
@@ -130,167 +126,23 @@ class CanonCamera(
             }
         }
 
-        sessionExclusionList.clear()
-        session.log.d(TAG, "Session exclusion list reset for new camera connection")
-
         val currentTotalImageByStorage = mutableMapOf<Int, Int>()
         while (executor.isRunning()) {
-            session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
-            val getEventCommand = EOSGetEventCommand(session)
-            executor.handleCommand(getEventCommand)
-            session.log.d(TAG, "execute: flush")
-            validStorageIds.forEach { storage ->
-                session.log.d(TAG, "execute: get handlers with storage $storage")
-                val getNumObjectsCommand = handlerCommandRetry(session, executor) {
-                    GetNumObjectsCommand(session, storage)
+            // ─────────────────────────────────────
+            // PHASE 1: Initial scan of all storages (iOS style)
+            // ─────────────────────────────────────
+            if (!finishLoadStorageImage) {
+                for (storage in storageIds) {
+                    processStorageHandlers(executor, storage, deviceInfo)
                 }
-                val latestTotalImages = getNumObjectsCommand.getResult().getOrDefault(0)
-                session.log.d(TAG, "execute: Total objects: $latestTotalImages ")
-
-                session.log.d(
-                    TAG,
-                    "execute: Total current=${currentTotalImageByStorage[storage]} latest=$latestTotalImages"
-                )
-
-                if (latestTotalImages > 0 && currentTotalImageByStorage[storage] == latestTotalImages) {
-                    session.log.d(
-                        TAG,
-                        "execute: counts match for storage $storage, skipping handler query"
-                    )
-                    currentTotalImageByStorage[storage] = latestTotalImages
-                    return@forEach
-                } else {
-                    session.log.d(
-                        TAG,
-                        "execute: counts differ for storage $storage, updating and fetching handlers"
-                    )
-                    currentTotalImageByStorage[storage] = latestTotalImages
-                }
-
-                val getHandlersCommand = handlerCommandRetry(session, executor) {
-                    GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
-                }
-
-                val handlers = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
-                session.log.d(
-                    TAG,
-                    "execute: get handlers with total ${handlers.size} handlers on storage $storage"
-                )
-
-                val handlerNotCache = handlers.filterNot { handlerId ->
-                    cacheImage.values.any {
-                        it.handlerId == handlerId
-                    }
-                }
-
-                session.log.d(
-                    TAG,
-                    "execute: get handlers with total ${handlerNotCache.size} handlers not cache on storage $storage"
-                )
-                handlerNotCache.forEach { handler ->
-                    val getObjectInfo = handlerCommandRetry(session, executor) {
-                        GetObjectInfoCommand(session, handler)
-                    }
-                    getObjectInfo.getResult().onFailure {
-                        session.log.e(TAG, "execute: failed when get object info, please restart the camera. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
-                        listenerCamera?.onError(Throwable("failed when get object info $handler, please restart the camera"))
-                        listenerCamera?.onStop()
-                        return@runBlocking
-                    }
-                    getObjectInfo.getResult().getOrNull()?.let { info ->
-                        val name = info.filename?.uppercase() ?: ""
-
-                        if (info.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
-                            (name.endsWith(".JPG") || name.endsWith(".JPEG"))
-                        ) {
-                            // ─────────────────────────────────────
-                            // PHASE 1: Scan & Deduplicate (NO full download)
-                            // ─────────────────────────────────────
-
-                            // Check exclusion list BEFORE fetching partial bytes
-                            val exclusionKey = "${handler}::${info.parentObject}"
-                            if (exclusionKey in sessionExclusionList) {
-                                session.log.d(TAG, "Handler $handler already processed this session; skipping EXIF fetch")
-                                return@let // Skip to next handler
-                            }
-
-                            // 1. Fetch only partial bytes for EXIF parsing
-                            val partialBytes = fetchPartialBytesForExif(executor, handler, info)
-
-                            // 2. Generate EXIF-based unique key from partial data
-                            val exifKey = if (partialBytes != null) {
-                                generateExifUniqueKeyFromBytes(partialBytes, info)
-                            } else {
-                                null // Fallback if partial fetch fails
-                            }
-
-                            // 3. Build composite unique key
-                            val compositeKey = generateCompositeUniqueKey(info, exifKey)
-
-                            // 4. Check if already cached (duplicate detection)
-                            if (cacheImage.containsKey(compositeKey)) {
-                                session.log.d(
-                                    TAG,
-                                    "Skipping duplicate image with composite key: $compositeKey"
-                                )
-                                // Mark as processed in exclusion list even if duplicate
-                                sessionExclusionList.add(exclusionKey)
-                                return@let // ❌ Skip: already cached, don't add again
-                            }
-
-                            // 5. ✅ Unique: Add to cache (metadata only, no image bytes yet)
-                            val entry = CachedImageEntry(info, compositeKey, info.handlerID)
-                            cacheImage[compositeKey] = entry
-
-                            session.log.d(
-                                TAG,
-                                "Cached unique image: $name with key: $compositeKey, handler: ${info.handlerID}"
-                            )
-
-                            // Mark as processed in exclusion list after successful caching
-                            sessionExclusionList.add(exclusionKey)
-                        } else {
-                            session.log.d(TAG, "Skipping non-JPEG object: $name")
-                        }
-                    }
-                }
+                finishLoadStorageImage = true
+                isSkipAutoUpload = false
             }
 
-            val filteredEntries = listenerCamera?.onHandlersFilter(cacheImage.values.toList()) ?: listOf()
-            val approvedCompositeKeys = filteredEntries.map { it.compositeKey }.toSet() // ← Key change!
-
-            session.log.d(
-                TAG,
-                "Download phase: ${approvedCompositeKeys.size} approved entries, ${cacheImage.size} cached"
-            )
-
-            // Download only entries that were approved
-            cacheImage.values.forEach { entry ->
-                // 🔑 Check by compositeKey
-                if (entry.compositeKey in approvedCompositeKeys) {
-                    val getEventCommand = EOSGetEventCommand(session)
-                    executor.handleCommand(getEventCommand)
-                    session.log.d(TAG, "execute getCleanHandlers: flush before download image")
-
-                    val objectImage = onDownloadImage(executor, entry.handlerId)
-
-                    // ✅ Attach CachedImageEntry to ObjectImage
-                    val enrichedImage = objectImage?.copy(cachedEntry = entry)
-                    // ✅ Check enrichedImage directly (cleaner flow)
-                    if (enrichedImage == null) {
-                        session.log.e(
-                            TAG,
-                            "execute: failed when download image ${entry.objectInfo.filename}"
-                        )
-                        listenerCamera?.onError(Throwable("failed when download image ${entry.objectInfo.filename}"))
-                        listenerCamera?.onStop()
-                        return@runBlocking
-                    }
-
-                    // ✅ Pass enriched image to listener
-                    listenerCamera?.onImageDownloaded(enrichedImage)
-                }
-            }
+            // ─────────────────────────────────────
+            // PHASE 2: Event-based polling (Canon EOS)
+            // ─────────────────────────────────────
+            pollForNewEvents(executor, storageIds.toList(), deviceInfo, currentTotalImageByStorage)
         }
         listenerCamera?.onStop()
     }
@@ -434,82 +286,511 @@ class CanonCamera(
         error("Worker is shutting down")
     }
 
-    private suspend fun fetchPartialBytesForExif(
-        worker: WorkerExecutor,
-        handler: Int,
-        objectInfo: ObjectInfo
-    ): ByteArray? {
+    private fun generateExifUniqueKeyFromBytes(partialBytes: ByteArray, objectInfo: ObjectInfo): String? {
         return try {
-            // ➕ ADDED: Minimum size check before EXIF parsing attempt
-            if (objectInfo.objectCompressedSize < 128) {
-                session.log.w(TAG, "File too small for EXIF: handler=$handler, size=${objectInfo.objectCompressedSize}")
-                return null
-            }
+            if (partialBytes.size < 128) return null
+            val exif = ExifInterface(ByteArrayInputStream(partialBytes))
 
-            val fetchSize = min(64 * 1024, objectInfo.objectCompressedSize)
-            val partialCmd = handlerCommandRetry(session, worker) {
-                GetObjectPartial(session, handler, 0, fetchSize)
-            }
-            partialCmd.getResult().getOrNull()
+            fun clean(value: String?): String = value?.trim()?.takeIf { it.isNotBlank() } ?: ""
+
+            val make = clean(exif.getAttribute(ExifInterface.TAG_MAKE))
+            val model = clean(exif.getAttribute(ExifInterface.TAG_MODEL))
+            val dateTime = clean(exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL))
+            val subSec = clean(
+                exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_DIGITIZED)
+                    ?: exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_ORIGINAL)
+            )
+            val uniqueId = clean(
+                exif.getAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID)
+                    ?: exif.getAttribute("ImageUniqueID")
+            )
+
+            if (model.isEmpty() || dateTime.isEmpty()) return null
+            "${make}_${model}_${dateTime}_${subSec}_${uniqueId}"
         } catch (e: Exception) {
-            session.log.w(TAG, "Failed to fetch partial bytes for EXIF: handler=$handler", e)
+            session.log.w(TAG, "EXIF parse failed", e)
             null
         }
     }
 
-
-    private fun generateCompositeUniqueKey(objectInfo: ObjectInfo, exifUniqueKey: String?): String {
-        val safeExifKey = exifUniqueKey ?: run {
-            session.log.w(
-                TAG,
-                "EXIF extraction failed for handler ${objectInfo.handlerID}; using fallback key (filename/size/date). Risk: false unique."
-            )
-            // Use unsigned hex for fallback too
-            "${objectInfo.filename}_${objectInfo.objectCompressedSize}_${objectInfo.captureDate}"
-                .hashCode().toUnsignedHex()
+    // Extracted: Extract EXIF key using partial fetch (efficient, matches iOS)
+    private suspend fun extractExifKeyFromImage(
+        executor: WorkerExecutor,
+        handler: Int,
+        objectInfo: ObjectInfo
+    ): String? {
+        return try {
+            if (objectInfo.objectCompressedSize < 128) return null
+            val fetchSize = min(64 * 1024, objectInfo.objectCompressedSize)
+            val partialCmd = handlerCommandRetry(session, executor) {
+                GetObjectPartial(session, handler, 0, fetchSize)
+            }
+            val partialBytes = partialCmd.getResult().getOrNull() ?: return null
+            generateExifUniqueKeyFromBytes(partialBytes, objectInfo)
+        } catch (e: Exception) {
+            session.log.w(TAG, "EXIF extraction failed", e)
+            null
         }
-        // Use '::' delimiter to avoid collision with hash content
-        return "${objectInfo.storageId}::${objectInfo.parentObject}::$safeExifKey"
     }
 
-    private fun generateExifUniqueKeyFromBytes(partialBytes: ByteArray, objectInfo: ObjectInfo): String? {
-        return try {
-            // Minimum byte check before parsing
-            if (partialBytes.size < 128) {
-                session.log.w(TAG, "Partial bytes too small for EXIF parsing: ${partialBytes.size}")
-                return null
+    // Extracted: Poll for new events (Canon-specific with GetNumObjects)
+    private suspend fun pollForNewEvents(
+        executor: WorkerExecutor,
+        storageIds: List<Int>,
+        deviceInfo: DeviceInfo,
+        currentTotalImageByStorage: MutableMap<Int, Int>
+    ) {
+        // Canon EOS event polling (may not work reliably for all Canon models)
+        val getEventCommand = EOSGetEventCommand(session)
+        executor.handleCommand(getEventCommand)
+
+        // Canon-specific: Use GetNumObjects to detect new images
+        for (storage in storageIds) {
+            val getNumObjectsCommand = handlerCommandRetry(session, executor) {
+                GetNumObjectsCommand(session, storage)
+            }
+            val latestTotalImages = getNumObjectsCommand.getResult().getOrDefault(0)
+            val previousCount = currentTotalImageByStorage[storage] ?: 0
+
+            // ✅ Process if count increased OR if this is first check
+            if (latestTotalImages > previousCount || previousCount == 0) {
+                currentTotalImageByStorage[storage] = latestTotalImages
+                // ✅ Re-use PHASE 1 logic for new handlers (matches pseudo-code)
+                processStorageHandlers(executor, storage, deviceInfo)
+            }
+        }
+    }
+
+    // Extracted: Process a single handler
+    // In CanonCamera.kt - simplify processHandler():
+    private suspend fun processHandler(
+        executor: WorkerExecutor,
+        handlerId: Int,
+        deviceInfo: DeviceInfo
+    ) {
+        val getObjectInfo = handlerCommandRetry(session, executor) {
+            GetObjectInfoCommand(session, handlerId)
+        }
+        val objectInfo = getObjectInfo.getResult().getOrNull() ?: run {
+            // ✅ Mark as processed even on GetObjectInfo failure to avoid retry spam
+            processedHandlerIds.add(handlerId)
+            return
+        }
+
+        val name = objectInfo.filename?.uppercase() ?: ""
+
+        // ✅ Skip non-JPEG silently but mark as processed
+        if (!(name.endsWith(".JPG") || name.endsWith(".JPEG")) ||
+            objectInfo.objectFormat != MtpConstants.FORMAT_EXIF_JPEG) {
+            processedHandlerIds.add(handlerId)  // ✅ Never re-check this handler
+            return
+        }
+
+        // ✅ Download image
+        val objectImage = onDownloadImage(executor, handlerId) ?: run {
+            // ✅ Mark failed downloads to avoid infinite retry loop
+            processedHandlerIds.add(handlerId)
+            return
+        }
+
+        // ✅ Extract EXIF key
+        val exifKey = extractExifKeyFromImage(executor, handlerId, objectInfo)
+
+        // ✅ Build wrapper and let app decide if it exists
+        val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifKey)
+        val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
+            objectInfoWithExif,
+            isSkipAutoUpload
+        ) ?: false
+
+        // ✅ Route through consumeImage for dedup + marking
+        if (isExist) {
+            // App says it exists → just track it without downloading again
+            consumeImageAlreadyTracked(handlerId, exifKey)
+        } else {
+            // App says it's new → download + track
+            consumeImage(objectImage, exifKey)
+        }
+    }
+
+//    private suspend fun processHandler(
+//        executor: WorkerExecutor,
+//        handlerId: Int,
+//        deviceInfo: DeviceInfo
+//    ) {
+//        // ✅ GetObjectInfo(handlerId)
+//        val getObjectInfo = handlerCommandRetry(session, executor) {
+//            GetObjectInfoCommand(session, handlerId)
+//        }
+//        val objectInfo = getObjectInfo.getResult().getOrNull() ?: return
+//        val name = objectInfo.filename?.uppercase() ?: ""
+//
+//        // ✅ Check JPEG/EXIF format (matches pseudo-code condition)
+//        if ((name.endsWith(".JPG") || name.endsWith(".JPEG")) &&
+//            objectInfo.objectFormat == MtpConstants.FORMAT_EXIF_JPEG) {
+//
+//            // ✅ Download Object (matches onDownloadObjectImage)
+//            val objectImage = onDownloadImage(executor, handlerId) ?: return
+//
+//            // ✅ Extract EXIF data (matches objectImage.getExifData)
+//            val exifKey = extractExifKeyFromImage(executor, handlerId, objectInfo)
+//
+//            // ✅ Build ObjectInfoWithExif wrapper (matches pseudo-code struct)
+//            val objectInfoWithExif = ObjectImageWithExif(
+//                objectInfo = objectInfo,
+//                exifKey = exifKey
+//            )
+//
+//            // ✅ Check database via callback (matches onIsImageAlreadyInDatabase)
+//            val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
+//                objectInfoWithExif,
+//                isSkipAutoUpload
+//            ) ?: false
+//
+//            if (isExist) {
+//                // ✅ Already in DB → track to avoid re-checking (matches pseudo-code)
+//                if (exifKey.isNullOrEmpty()) {
+//                    // No EXIF → track by handlerId (library fallback)
+//                    localExifDatabaseNotFound.add(handlerId.toString())
+//                } else {
+//                    // Has EXIF → track by EXIF signature
+//                    localExifDatabaseExist.add(exifKey)
+//                }
+//            } else {
+//                // ✅ New image → consume (matches pseudo-code: consumeImage)
+//                consumeImage(objectImage, exifKey)
+//            }
+//        } else {
+//            // ✅ Non-JPEG → add to raw database (matches pseudo-code else branch)
+//            localRawDatabase.add(handlerId)
+//        }
+//    }
+
+    // Extracted: Consume image logic
+    // In CanonCamera.kt - update consumeImage:
+//    private suspend fun consumeImage(objectImage: ObjectImage, exifData: String?) {
+//        // ✅ Library-side deduplication before calling app callback
+//        if (exifData.isNullOrEmpty()) {
+//            val fallbackKey = objectImage.handlerId.toString()
+//            if (localExifDatabaseNotFound.contains(fallbackKey)) {
+//                session.log.d(TAG, "consumeImage: skip duplicate (no EXIF) handler=${objectImage.handlerId}")
+//                return
+//            }
+//            localExifDatabaseNotFound.add(fallbackKey)
+//        } else {
+//            if (localExifDatabaseExist.contains(exifData)) {
+//                session.log.d(TAG, "consumeImage: skip duplicate (with EXIF) key=${exifData.take(50)}")
+//                return
+//            }
+//            localExifDatabaseExist.add(exifData)
+//        }
+//
+//        // ✅ Pass to app layer for saving
+//        listenerCamera?.onImageDownloaded(objectImage)
+//
+//        // ✅ NEW: Mark handler as fully processed (prevents re-download on next poll)
+//        processedHandlerIds.add(objectImage.handlerId)
+//        session.log.d(TAG, "✅ Marked handler ${objectImage.handlerId} as processed")
+//    }
+
+    // Update processStorageHandlers:
+    private suspend fun processStorageHandlers(
+        executor: WorkerExecutor,
+        storage: Int,
+        deviceInfo: DeviceInfo
+    ) {
+        val getHandlersCommand = handlerCommandRetry(session, executor) {
+            GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
+        }
+        val handlersFromStorage = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
+
+        val handlerCleanFromRaw = handlersFromStorage.filterNot { localRawDatabase.contains(it) }
+
+        for (handlerId in handlerCleanFromRaw) {
+            // ✅ NEW: Skip if already fully processed (prevents re-download)
+            if (processedHandlerIds.contains(handlerId)) {
+                session.log.d(TAG, "⏭️ Skip handler $handlerId: already processed")
+                continue
             }
 
-            val exif = ExifInterface(ByteArrayInputStream(partialBytes))
+            // ✅ Quick skip: if already tracked as "no EXIF" by handlerId
+            if (localExifDatabaseNotFound.contains(handlerId.toString())) {
+                processedHandlerIds.add(handlerId)  // ✅ Mark as processed to avoid re-check
+                continue
+            }
 
-            val dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
-                ?: ""
-
-            // 👇 ADD THIS: Sub-second precision for burst shots
-            val subSec = exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_ORIGINAL)
-                ?: exif.getAttribute("SubSecTimeOriginal")
-                ?: exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_DIGITIZED)
-                ?: exif.getAttribute("SubSecTimeDigitized")
-                ?: ""
-
-            val make = exif.getAttribute(ExifInterface.TAG_MAKE) ?: ""
-            val model = exif.getAttribute(ExifInterface.TAG_MODEL) ?: ""
-            val uniqueId = exif.getAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID)
-                ?: exif.getAttribute("ImageUniqueID")
-                ?: ""
-
-            // Deterministic hash with sub-second + unique ID
-            val rawKey = "$dateTime-$subSec-$uniqueId-$make-$model-${objectInfo.objectCompressedSize}"
-            // Use unsigned hex to avoid negative hash values
-            rawKey.hashCode().toUnsignedHex()
-        } catch (e: Exception) {
-            session.log.w(TAG, "EXIF parse failed for handler ${objectInfo.handlerID}", e)
-            null // → Triggers fail-safe fallback
+            // ✅ Process this handler
+            processHandler(executor, handlerId, deviceInfo)
         }
     }
 
-    private fun Int.toUnsignedHex(): String = this.toUInt().toString(16)
+    private fun consumeImageAlreadyTracked(handlerId: Int, exifKey: String?) {
+        if (exifKey.isNullOrEmpty()) {
+            localExifDatabaseNotFound.add(handlerId.toString())
+        } else {
+            localExifDatabaseExist.add(exifKey)
+        }
+        // ✅ Critical: Mark as processed to skip future polls
+        processedHandlerIds.add(handlerId)
+        session.log.d(TAG, "✅ Tracked existing handler $handlerId (exifKey=${exifKey?.take(30) ?: "null"})")
+    }
+
+    // Update consumeImage to mark handler as processed:
+    private suspend fun consumeImage(objectImage: ObjectImage, exifData: String?) {
+        // ✅ Library-side deduplication before calling app callback
+        if (exifData.isNullOrEmpty()) {
+            val fallbackKey = objectImage.handlerId.toString()
+            if (localExifDatabaseNotFound.contains(fallbackKey)) {
+                session.log.d(TAG, "consumeImage: skip duplicate (no EXIF) handler=${objectImage.handlerId}")
+                return
+            }
+            localExifDatabaseNotFound.add(fallbackKey)
+        } else {
+            if (localExifDatabaseExist.contains(exifData)) {
+                session.log.d(TAG, "consumeImage: skip duplicate (with EXIF) key=${exifData.take(50)}")
+                return
+            }
+            localExifDatabaseExist.add(exifData)
+        }
+
+        // ✅ Pass to app layer for saving
+        listenerCamera?.onImageDownloaded(objectImage)
+
+        // ✅ NEW: Mark handler as fully processed (prevents re-download on next poll)
+        processedHandlerIds.add(objectImage.handlerId)
+        session.log.d(TAG, "✅ Marked handler ${objectImage.handlerId} as processed")
+    }
+
+//    private suspend fun consumeImage(objectImage: ObjectImage, exifData: String?) {
+//        // ✅ Library-side deduplication before calling app callback
+//
+//        if (exifData.isNullOrEmpty()) {
+//            // ── Case: No EXIF ─────────────────────────────
+//            // Use handlerId as fallback key (library can't access objectInfo.getId())
+//            val fallbackKey = objectImage.handlerId.toString()
+//
+//            if (localExifDatabaseNotFound.contains(fallbackKey)) {
+//                // ✅ Already tracked → skip to avoid duplicate download
+//                session.log.d(TAG, "consumeImage: skip duplicate (no EXIF) handler=${objectImage.handlerId}")
+//                return
+//            }
+//            // ✅ First time → track and proceed
+//            localExifDatabaseNotFound.add(fallbackKey)
+//
+//        } else {
+//            // ── Case: Has EXIF ────────────────────────────
+//            // Use EXIF signature as deduplication key
+//
+//            if (localExifDatabaseExist.contains(exifData)) {
+//                // ✅ Already tracked → skip to avoid duplicate download
+//                session.log.d(TAG, "consumeImage: skip duplicate (with EXIF) key=${exifData.take(50)}")
+//                return
+//            }
+//            // ✅ First time → track and proceed
+//            localExifDatabaseExist.add(exifData)
+//        }
+//
+//        // ✅ Pass to app layer for saving (matches onImageDownloadCallback)
+//        listenerCamera?.onImageDownloaded(objectImage)
+//    }
+
+    // Extracted: Process handlers for a single storage
+    // In CanonCamera.kt - update processStorageHandlers:
+//    private suspend fun processStorageHandlers(
+//        executor: WorkerExecutor,
+//        storage: Int,
+//        deviceInfo: DeviceInfo
+//    ) {
+//        // ✅ Get handlers from storage
+//        val getHandlersCommand = handlerCommandRetry(session, executor) {
+//            GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
+//        }
+//        val handlersFromStorage = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
+//
+//        // ✅ Filter 1: Remove raw handlers
+//        val handlerCleanFromRaw = handlersFromStorage.filterNot { localRawDatabase.contains(it) }
+//
+//        for (handlerId in handlerCleanFromRaw) {
+//            // ✅ NEW: Skip if already fully processed (avoid ALL MTP calls)
+//            if (processedHandlerIds.contains(handlerId)) {
+//                session.log.d(TAG, "⏭️ Skip handler $handlerId: already processed")
+//                continue
+//            }
+//
+//            // ✅ Quick skip: if already tracked as "no EXIF" by handlerId
+//            if (localExifDatabaseNotFound.contains(handlerId.toString())) {
+//                processedHandlerIds.add(handlerId)  // ✅ Mark as processed to avoid re-check
+//                continue
+//            }
+//
+//            // ✅ Process this handler
+//            processHandler(executor, handlerId, deviceInfo)
+//        }
+//    }
+
+
+
+
+    ///asdghjs
+
+//    private suspend fun processStorageHandlers(
+//        executor: WorkerExecutor,
+//        storage: Int,
+//        deviceInfo: DeviceInfo
+//    ) {
+//        // ✅ Get handlers from storage (matches getObjectsHandlers)
+//        val getHandlersCommand = handlerCommandRetry(session, executor) {
+//            GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
+//        }
+//        val handlersFromStorage = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
+//
+//        // ✅ Filter 1: Remove raw handlers (matches pseudo-code: localRawDatabase.notContains)
+//        val handlerCleanFromRaw = handlersFromStorage.filterNot { localRawDatabase.contains(it) }
+//
+//        // ⚠️ Can't pre-filter by EXIF key without downloading first!
+//        // So we process each handler individually and let the callback handle DB check
+//
+//        for (handlerId in handlerCleanFromRaw) {
+//            // ✅ Quick skip: if already tracked as "no EXIF" by handlerId
+//            if (localExifDatabaseNotFound.contains(handlerId.toString())) {
+//                continue
+//            }
+//            // ✅ Process this handler
+//            processHandler(executor, handlerId, deviceInfo)
+//        }
+//    }
+
+
+//    private suspend fun processStorageHandlers(
+//        executor: WorkerExecutor,
+//        storage: Int,
+//        deviceInfo: DeviceInfo
+//    ) {
+//        // ✅ Get handlers from storage (matches getObjectsHandlers)
+//        // MODIFIED: Changed FORMAT_EXIF_JPEG to 0 to request ALL formats (including RAW)
+//        val getHandlersCommand = handlerCommandRetry(session, executor) {
+//            GetObjectHandlesCommand(session, storage, 0)
+//        }
+//        val handlersFromStorage = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
+//
+//        // 🔍 LOG: Handler count from camera
+//        session.log.d(TAG, "🔍 [ProntoLib] processStorageHandlers: storage=$storage, formatParam=0 (ALL), handlersFound=${handlersFromStorage.size}")
+//
+//        // ✅ Filter 1: Remove raw handlers (matches pseudo-code: localRawDatabase.notContains)
+//        // MODIFIED: Commented out filter to allow RAW handlers to pass through
+//        // val handlerCleanFromRaw = handlersFromStorage.filterNot { localRawDatabase.contains(it) }
+//        val handlerCleanFromRaw = handlersFromStorage // Temporarily pass all handlers
+//
+//        session.log.d(TAG, "📦 [ProntoLib] After raw filter: ${handlerCleanFromRaw.size} handlers to process")
+//
+//        // ⚠️ Can't pre-filter by EXIF key without downloading first!
+//        // So we process each handler individually and let the callback handle DB check
+//        for (handlerId in handlerCleanFromRaw) {
+//            // ✅ Quick skip: if already tracked as "no EXIF" by handlerId
+//            if (localExifDatabaseNotFound.contains(handlerId.toString())) {
+//                session.log.d(TAG, "⏭️ [ProntoLib] Skip handler $handlerId: already tracked as no-EXIF")
+//                continue
+//            }
+//            // ✅ Process this handler
+//            processHandler(executor, handlerId, deviceInfo)
+//        }
+//
+//        session.log.d(TAG, "✅ [ProntoLib] processStorageHandlers complete for storage $storage")
+//    }
+//
+//    private suspend fun processHandler(
+//        executor: WorkerExecutor,
+//        handlerId: Int,
+//        deviceInfo: DeviceInfo
+//    ) {
+//        val getObjectInfo = handlerCommandRetry(session, executor) {
+//            GetObjectInfoCommand(session, handlerId)
+//        }
+//        val objectInfo = getObjectInfo.getResult().getOrNull() ?: return
+//        val name = objectInfo.filename?.uppercase() ?: ""
+//        val format = objectInfo.objectFormat
+//
+//        // 🔍 LOG: Handler info
+//        session.log.d(TAG, "📁 [ProntoLib] processHandler: handlerId=$handlerId, format=0x${format.toString(16)}, filename=${objectInfo.filename}, size=${objectInfo.objectCompressedSize}")
+//
+//        val isFolder = format == 0x3001
+//        if (isFolder || objectInfo.objectCompressedSize == 0) {
+//            session.log.d(TAG, "⏭️ [ProntoLib] Skipping non-image: format=0x${format.toString(16)}, size=${objectInfo.objectCompressedSize}")
+//            return  // Skip this handler early
+//        }
+//
+//        // ✅ Log RAW detection for debugging
+//        if (format !in listOf(MtpConstants.FORMAT_EXIF_JPEG, MtpConstants.FORMAT_EXIF_JPEG)) {
+//            session.log.d(TAG, "🎞️ [ProntoLib] Processing non-JPEG format: 0x${format.toString(16)}")
+//        }
+//
+//        // ✅ Check if it's a known RAW format (for logging)
+//        val isRawFormat = format !in listOf(
+//            MtpConstants.FORMAT_EXIF_JPEG,
+//
+//        )
+//
+//        if (isRawFormat) {
+//            session.log.d(TAG, "🎞️ [ProntoLib] Detected RAW format: 0x${format.toString(16)}")
+//        }
+//
+//        // ✅ Process all image formats (JPEG + RAW)
+//        if (true) {
+//            // ✅ Download Object (matches onDownloadObjectImage)
+//            val objectImage = onDownloadImage(executor, handlerId) ?: return
+//
+//            // 🔍 LOG: Download result
+//            session.log.d(TAG, "⬇️ [ProntoLib] Downloaded: handlerId=$handlerId, bytes=${objectImage.image.bytes.size}, bitmap=${objectImage.image.bitmap != null}")
+//
+//            // ✅ Extract EXIF data (matches objectImage.getExifData)
+//            val exifKey = try {
+//                extractExifKeyFromImage(executor, handlerId, objectInfo)
+//            } catch (e: Exception) {
+//                // 🔍 LOG: EXIF extraction failed (sample format you provided)
+//                session.log.w(TAG, "[ProntoLib] EXIF extraction failed for handler $handlerId: ${objectInfo.filename}", e)
+//                null
+//            }
+//
+//            if (exifKey != null) {
+//                session.log.d(TAG, "🔐 [ProntoLib] EXIF extracted: key=${exifKey.take(30)}...")
+//            } else {
+//                session.log.d(TAG, "⚠️ [ProntoLib] No EXIF key extracted (expected for RAW or corrupted EXIF)")
+//            }
+//
+//            // ✅ Build ObjectInfoWithExif wrapper (matches pseudo-code struct)
+//            val objectInfoWithExif = ObjectImageWithExif(
+//                objectInfo = objectInfo,
+//                exifKey = exifKey
+//            )
+//
+//            // ✅ Check database via callback (matches onIsImageAlreadyInDatabase)
+//            val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
+//                objectInfoWithExif,
+//                isSkipAutoUpload
+//            ) ?: false
+//
+//            if (isExist) {
+//                // ✅ Already in DB → track to avoid re-checking
+//                session.log.d(TAG, "✅ [ProntoLib] Duplicate found, skipping: handlerId=$handlerId")
+//                if (exifKey.isNullOrEmpty()) {
+//                    // No EXIF → track by handlerId (library fallback)
+//                    localExifDatabaseNotFound.add(handlerId.toString())
+//                } else {
+//                    // Has EXIF → track by EXIF signature
+//                    localExifDatabaseExist.add(exifKey)
+//                }
+//            } else {
+//                // ✅ New image → consume (matches pseudo-code: consumeImage)
+//                session.log.d(TAG, "🆕 [ProntoLib] New image, consuming: handlerId=$handlerId, exifKey=${exifKey?.take(30) ?: "null"}")
+//                consumeImage(objectImage, exifKey)
+//            }
+//        }
+//        // MODIFIED: Commented out else block that added RAW files to ignore list
+//        // else {
+//        //     // ✅ Non-JPEG → add to raw database (matches pseudo-code else branch)
+//        //     localRawDatabase.add(handlerId)
+//        // }
+//    }
 
     companion object {
         private const val TAG = "CanonCamera"
