@@ -64,16 +64,6 @@ class SonyCamera(private val session: Session): BaseCamera() {
 
         requestPtpMode(executor)
 
-        // This cause the problem on Sony A7IV
-        // TODO please check this for the Sony A7IV, maybe this cause the problem of the image
-//        val checkStorageID = GetStorageIdsCommand(session)
-//        executor.handleCommand(checkStorageID)
-//        val storageID = checkStorageID.getResult().getOrNull()
-//
-//        if (storageID != null) {
-//            session.log.d(TAG, "getCommand: checkStorageID $storageID size ${storageID.size}")
-//        }
-
         listenerCamera?.onReady()
         while (executor.isRunning()) {
             val eventCheckCommand = SonyEventCheckCommand(session)
@@ -101,21 +91,6 @@ class SonyCamera(private val session: Session): BaseCamera() {
             } else {
                 delay(3000)
             }
-
-//            val event = fetchEvent(executor)
-//            if (event != null) {
-//                val handlerID = getHandlerObjectAdded(event)
-//                if (handlerID != null) {
-//                    globalHandlerID = handlerID
-//                    session.log.d(TAG, "setGlobalHandler: handlerID $handlerID")
-////                    if (eventCheckCommand.content.isEmpty()) {
-////                        FirebaseCrashlytics.getInstance().log("getCommand: empty event check so we trigger with event object added")
-////                        val objectImage = onDownloadImage(worker, handlerID) // -16383
-////                        objectImage?.let { _onImageDownloaded?.invoke(it) }
-////                        Log.d(TAG, String.format("getCommand: finish download image %d",handlerID))
-////                    }
-//                }
-//            }
         }
         listenerCamera?.onStop()
     }

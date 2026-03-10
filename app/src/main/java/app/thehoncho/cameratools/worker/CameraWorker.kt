@@ -27,9 +27,9 @@ import app.thehoncho.pronto.camera.BaseCamera
 import app.thehoncho.pronto.camera.CanonCamera
 import app.thehoncho.pronto.camera.NikonCamera
 import app.thehoncho.pronto.camera.SonyCamera
-import app.thehoncho.pronto.model.CachedImageEntry
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.model.ObjectImage
+import app.thehoncho.pronto.model.ObjectImageWithExif
 import app.thehoncho.pronto.model.ObjectInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
@@ -47,6 +47,10 @@ class CameraWorker(
     private var logger = createLoggerDefault()
     private var worker: Worker? = null
     private var sonyImage = 0
+
+    // ✅ Simple in-memory tracking (session-only, no DB)
+    private val processedHandlerIds = mutableSetOf<String>()
+    private val processedExifKeys = mutableSetOf<String>()
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(p0: Context, p1: Intent) {
@@ -121,9 +125,33 @@ class CameraWorker(
                             // no need to force close, cause it will be trigger onStop after this
                         }
 
-                        override suspend fun onHandlersFilter(handlers: List<CachedImageEntry>): List<CachedImageEntry> {
+                        override suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo> {
                             logger.d(TAG, "onHandlersFilter: ${handlers.size}")
                             return handlers.lastOrNull()?.let { listOf(it) } ?: listOf()
+                        }
+
+                        override suspend fun onIsImageAlreadyInDatabase(
+                            objectInfoWithExif: ObjectImageWithExif,
+                            isSkipAutoUpload: Boolean
+                        ): Boolean {
+                            val exifKey = objectInfoWithExif.exifKey
+                            val fallbackId = objectInfoWithExif.objectInfo.handlerID.toString()
+
+                            // ✅ First-sync: skip images we've already seen this session
+                            if (isSkipAutoUpload) {
+                                return if (!exifKey.isNullOrEmpty()) {
+                                    processedExifKeys.contains(exifKey)
+                                } else {
+                                    processedHandlerIds.contains(fallbackId)
+                                }
+                            }
+
+                            // ✅ Real-time: check and track (same logic as before)
+                            return if (!exifKey.isNullOrEmpty()) {
+                                if (processedExifKeys.contains(exifKey)) true else { processedExifKeys.add(exifKey); false }
+                            } else {
+                                if (processedHandlerIds.contains(fallbackId)) true else { processedHandlerIds.add(fallbackId); false }
+                            }
                         }
 
                         override suspend fun onImageDownloaded(objectImage: ObjectImage) {
@@ -163,9 +191,33 @@ class CameraWorker(
                             // no need to force close, cause it will be trigger onStop after this
                         }
 
-                        override suspend fun onHandlersFilter(handlers: List<CachedImageEntry>): List<CachedImageEntry> {
+                        override suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo> {
                             // Sony never use this
                             return emptyList()
+                        }
+
+                        override suspend fun onIsImageAlreadyInDatabase(
+                            objectInfoWithExif: ObjectImageWithExif,
+                            isSkipAutoUpload: Boolean
+                        ): Boolean {
+                            val exifKey = objectInfoWithExif.exifKey
+                            val fallbackId = objectInfoWithExif.objectInfo.handlerID.toString()
+
+                            // ✅ First-sync: skip images we've already seen this session
+                            if (isSkipAutoUpload) {
+                                return if (!exifKey.isNullOrEmpty()) {
+                                    processedExifKeys.contains(exifKey)
+                                } else {
+                                    processedHandlerIds.contains(fallbackId)
+                                }
+                            }
+
+                            // ✅ Real-time: check and track (same logic as before)
+                            return if (!exifKey.isNullOrEmpty()) {
+                                if (processedExifKeys.contains(exifKey)) true else { processedExifKeys.add(exifKey); false }
+                            } else {
+                                if (processedHandlerIds.contains(fallbackId)) true else { processedHandlerIds.add(fallbackId); false }
+                            }
                         }
 
                         override suspend fun onImageDownloaded(objectImage: ObjectImage) {
@@ -204,9 +256,33 @@ class CameraWorker(
                             // no need to force close, cause it will be trigger onStop after this
                         }
 
-                        override suspend fun onHandlersFilter(handlers: List<CachedImageEntry>): List<CachedImageEntry> {
+                        override suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo> {
                             logger.d(TAG, "onHandlersFilter: ${handlers.size}")
                             return handlers.lastOrNull()?.let { listOf(it) } ?: listOf()
+                        }
+
+                        override suspend fun onIsImageAlreadyInDatabase(
+                            objectInfoWithExif: ObjectImageWithExif,
+                            isSkipAutoUpload: Boolean
+                        ): Boolean {
+                            val exifKey = objectInfoWithExif.exifKey
+                            val fallbackId = objectInfoWithExif.objectInfo.handlerID.toString()
+
+                            // ✅ First-sync: skip images we've already seen this session
+                            if (isSkipAutoUpload) {
+                                return if (!exifKey.isNullOrEmpty()) {
+                                    processedExifKeys.contains(exifKey)
+                                } else {
+                                    processedHandlerIds.contains(fallbackId)
+                                }
+                            }
+
+                            // ✅ Real-time: check and track (same logic as before)
+                            return if (!exifKey.isNullOrEmpty()) {
+                                if (processedExifKeys.contains(exifKey)) true else { processedExifKeys.add(exifKey); false }
+                            } else {
+                                if (processedHandlerIds.contains(fallbackId)) true else { processedHandlerIds.add(fallbackId); false }
+                            }
                         }
 
                         override suspend fun onImageDownloaded(objectImage: ObjectImage) {

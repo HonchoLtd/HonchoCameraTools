@@ -1,9 +1,9 @@
 package app.thehoncho.pronto.camera
 
 import app.thehoncho.pronto.command.MultipleCommand
-import app.thehoncho.pronto.model.CachedImageEntry
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.model.ObjectImage
+import app.thehoncho.pronto.model.ObjectImageWithExif
 import app.thehoncho.pronto.model.ObjectInfo
 
 abstract class BaseCamera: MultipleCommand() {
@@ -42,9 +42,17 @@ abstract class BaseCamera: MultipleCommand() {
         // call when the command to get device info failed
         // its mean something wrong with USB connection, or the port/cable not work correctly
         suspend fun onDeviceFailedToConnect(exception: Throwable)
-        // call when the camera to filter the handler, handler return from this function will use
+
+        // Call when the camera to filter the handler, handler return from this function will use
         // to download the image
-        suspend fun onHandlersFilter(handlers: List<CachedImageEntry>): List<CachedImageEntry>
+        // Pre-download filtering (Canon/Nikon only, inefficient)
+        @Deprecated("Canon and Nikon: use post-download onIsImageAlreadyInDatabase instead")
+        suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo>
+        // Library passes raw data; app decides how to build unique key
+        suspend fun onIsImageAlreadyInDatabase(
+            objectInfoWithExif: ObjectImageWithExif,
+            isSkipAutoUpload: Boolean
+        ): Boolean
         // call when the image already downloaded from camera to the byte array
         // this will be called multiple time base on the return from onHandlersFilter
         suspend fun onImageDownloaded(objectImage: ObjectImage)

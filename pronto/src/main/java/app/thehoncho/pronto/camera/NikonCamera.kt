@@ -1,568 +1,464 @@
-package app.thehoncho.pronto.camera
+    package app.thehoncho.pronto.camera
 
-import android.graphics.BitmapFactory
-import android.mtp.MtpConstants
-import androidx.exifinterface.media.ExifInterface
-import app.thehoncho.pronto.Session
-import app.thehoncho.pronto.WorkerExecutor
-import app.thehoncho.pronto.command.Command
-import app.thehoncho.pronto.command.eos.EOSRequestPCModeCommand
-import app.thehoncho.pronto.command.general.CloseSessionCommand
-import app.thehoncho.pronto.command.general.GetDeviceInfoCommand
-import app.thehoncho.pronto.command.general.GetNumObjectsCommand
-import app.thehoncho.pronto.command.general.GetObjectCommand
-import app.thehoncho.pronto.command.general.GetObjectHandlesCommand
-import app.thehoncho.pronto.command.general.GetObjectInfoCommand
-import app.thehoncho.pronto.command.general.GetObjectPartial
-import app.thehoncho.pronto.command.general.GetStorageIdsCommand
-import app.thehoncho.pronto.command.general.GetStorageInfoCommand
-import app.thehoncho.pronto.command.general.OpenSessionCommand
-import app.thehoncho.pronto.command.nikon.NikonGetDevicePropCommand
-import app.thehoncho.pronto.command.nikon.NikonGetEventCommand
-import app.thehoncho.pronto.model.CachedImageEntry
-import app.thehoncho.pronto.model.DeviceInfo
-import app.thehoncho.pronto.model.ImageObject
-import app.thehoncho.pronto.model.ObjectImage
-import app.thehoncho.pronto.model.ObjectInfo
-import app.thehoncho.pronto.utils.PtpConstants
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
-import java.io.ByteArrayInputStream
-import java.nio.ByteBuffer
-import kotlin.math.min
+    import android.graphics.BitmapFactory
+    import android.mtp.MtpConstants
+    import androidx.exifinterface.media.ExifInterface
+    import app.thehoncho.pronto.Session
+    import app.thehoncho.pronto.WorkerExecutor
+    import app.thehoncho.pronto.command.Command
+    import app.thehoncho.pronto.command.eos.EOSRequestPCModeCommand
+    import app.thehoncho.pronto.command.general.CloseSessionCommand
+    import app.thehoncho.pronto.command.general.GetDeviceInfoCommand
+    import app.thehoncho.pronto.command.general.GetNumObjectsCommand
+    import app.thehoncho.pronto.command.general.GetObjectCommand
+    import app.thehoncho.pronto.command.general.GetObjectHandlesCommand
+    import app.thehoncho.pronto.command.general.GetObjectInfoCommand
+    import app.thehoncho.pronto.command.general.GetObjectPartial
+    import app.thehoncho.pronto.command.general.GetStorageIdsCommand
+    import app.thehoncho.pronto.command.general.GetStorageInfoCommand
+    import app.thehoncho.pronto.command.general.OpenSessionCommand
+    import app.thehoncho.pronto.command.nikon.NikonGetDevicePropCommand
+    import app.thehoncho.pronto.command.nikon.NikonGetEventCommand
+    import app.thehoncho.pronto.model.DeviceInfo
+    import app.thehoncho.pronto.model.ImageObject
+    import app.thehoncho.pronto.model.ObjectImage
+    import app.thehoncho.pronto.model.ObjectImageWithExif
+    import app.thehoncho.pronto.model.ObjectInfo
+    import app.thehoncho.pronto.utils.PtpConstants
+    import kotlinx.coroutines.delay
+    import kotlinx.coroutines.runBlocking
+    import java.io.ByteArrayInputStream
+    import java.nio.ByteBuffer
+    import kotlin.math.min
 
-class NikonCamera(
-    private val session: Session
-): BaseCamera() {
-    private var isPartialSupport = false
-//    private var cacheImage = mutableMapOf<Int, ObjectInfo>()
+    class NikonCamera(
+        private val session: Session
+    ): BaseCamera() {
+        private var isPartialSupport = false
 
-    // Volatile session exclusion list for O(1) duplicate skip
-    private var sessionExclusionList = mutableSetOf<String>() // Format: "handlerId::parentId"
-    private var cacheImage = mutableMapOf<String, CachedImageEntry>() // Key = compositeKey
+        // ✅ In-memory deduplication sets
+        private val localRawDatabase = mutableSetOf<Int>()              // [handlerId] for non-JPEG
+        private val processedHandlerIds = mutableSetOf<Int>()           // ✅ NEW: Track fully processed handlers
+        private val localExifDatabaseExist = mutableSetOf<String>()     // [exifData string]
+        private val localExifDatabaseNotFound = mutableSetOf<String>()  // [handlerId string] for no-EXIF
 
+        private var isSkipAutoUpload = true           // ✅ Flag for first-sync behavior
+        private var finishLoadStorageImage = false    // ✅ Track if initial scan completed
 
-    override fun execute(executor: WorkerExecutor) = runBlocking {
-        val deviceInfo = onConnecting(executor)
-        if (deviceInfo == null) {
-            session.log.e(TAG, "execute: failed when connecting")
-            listenerCamera?.onDeviceFailedToConnect(Throwable("failed when get device info, please check the cable or port"))
-            listenerCamera?.onStop()
-            return@runBlocking
-        }
-        listenerCamera?.onDeviceConnected(deviceInfo)
-        // onDeviceInfoCallback?.invoke(deviceInfo)
-
-        deviceInfo.operationsSupported.forEach { opt ->
-            if (opt.toShort() == PtpConstants.Operation.GetPartialObject) {
-                isPartialSupport = true
-                return@forEach
+        override fun execute(executor: WorkerExecutor) = runBlocking {
+            val deviceInfo = onConnecting(executor)
+            if (deviceInfo == null) {
+                session.log.e(TAG, "execute: failed when connecting")
+                listenerCamera?.onDeviceFailedToConnect(Throwable("failed when get device info, please check the cable or port"))
+                listenerCamera?.onStop()
+                return@runBlocking
             }
-        }
+            listenerCamera?.onDeviceConnected(deviceInfo)
+            // onDeviceInfoCallback?.invoke(deviceInfo)
 
-        val getStorageIds = GetStorageIdsCommand(session)
-        executor.handleCommand(getStorageIds)
-        getStorageIds.getResult().onFailure {
-            session.log.e(TAG, "execute: failed when get storage ids, maybe storage empty. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
-            listenerCamera?.onError(Throwable("failed when get storage ids, please check the sd card"))
-            listenerCamera?.onStop()
-            return@runBlocking
-        }
-        val storageIds = getStorageIds.getResult().getOrNull() ?: return@runBlocking
-
-        if (storageIds.isEmpty()) {
-            session.log.e(TAG, "execute: storageIds is empty. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
-            listenerCamera?.onError(Throwable("storage ids is empty, please check the sd card"))
-            listenerCamera?.onStop()
-            return@runBlocking
-        }
-
-        var finishLoadStorageImage = false
-        listenerCamera?.onReady()
-        // Pre-check storage info before looping
-        val validStorageIds = mutableListOf<Int>()
-        storageIds.forEach { storage ->
-            val getStorageInfoCmd = GetStorageInfoCommand(session, storage)
-            session.log.d(TAG, "Checking storage $storage with GetStorageInfoCommand")
-            executor.handleCommand(getStorageInfoCmd)
-            when(getStorageInfoCmd.responseCode) {
-                PtpConstants.Response.Ok -> {
-                    session.log.d(TAG, "Executed GetStorageInfoCommand for $storage")
-                    val storageInfoResult = getStorageInfoCmd.getResult()
-                    session.log.d(TAG, "Result for $storage: $storageInfoResult")
-                    storageInfoResult.getOrNull()?.let { info ->
-                        session.log.d(TAG, "Storage $storage info: type=${info.storageType}, fsType=${info.filesystemType}, maxCapacity=${info.maxCapacity}, freeSpace=${info.freeSpaceInBytes}")
-                        if (info.maxCapacity > 0) {
-                            validStorageIds.add(storage)
-                            session.log.d(TAG, "Storage $storage is valid with capacity ${info.maxCapacity}")
-                        } else {
-                            session.log.e(TAG, "Storage $storage has maxCapacity=0, skipping")
-                        }
-                    }
-                }
-                PtpConstants.Response.StoreNotAvailable -> {
-                    session.log.w(TAG, "Storage Not Available id: $storage")
-                }
-                else -> {
-                    session.log.e(TAG, "Storage: Cannot populate storage, please check the storage")
-                    listenerCamera?.onError(Throwable("Cannot populate storage, please check the storage"))
-                    listenerCamera?.onStop()
-                    return@runBlocking
+            deviceInfo.operationsSupported.forEach { opt ->
+                if (opt.toShort() == PtpConstants.Operation.GetPartialObject) {
+                    isPartialSupport = true
+                    return@forEach
                 }
             }
-        }
 
-        // Reset exclusion list at start of each session (camera connect)
-        sessionExclusionList.clear()
-        session.log.d(TAG, "Session exclusion list reset for new camera connection")
-
-        while (executor.isRunning()) {
-            if (!finishLoadStorageImage) {
-                session.log.d(TAG, "execute: get handlers with total ${storageIds.size} storage")
-                validStorageIds.forEach { storage ->
-                    val getHandlersCommand = handlerCommandRetry(session, executor) {
-                        GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
-                    }
-
-                    getHandlersCommand.getResult().onFailure {
-                        session.log.w(
-                            TAG,
-                            "execute: failed when get handlers, maybe the handler its empty"
-                        )
-                    }
-
-                    val handlers = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
-                    session.log.d(
-                        TAG,
-                        "execute: get handlers with total ${handlers.size} handlers on storage $storage"
-                    )
-
-                    val handlerNotCache = handlers.filterNot { handlerId ->
-                        cacheImage.values.any { it.handlerId == handlerId }
-                    }
-
-                    session.log.d(
-                        TAG,
-                        "execute: get handlers with total ${handlerNotCache.size} handlers not cache on storage $storage"
-                    )
-
-                    handlerNotCache.forEach { handler ->
-                        val getObjectInfo = handlerCommandRetry(session, executor) {
-                            GetObjectInfoCommand(session, handler)
-                        }
-                        getObjectInfo.getResult().onFailure {
-                            session.log.e(TAG, "execute: failed when get object info, please restart the camera. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
-                            listenerCamera?.onError(Throwable("failed when get object info $handler, please restart the camera"))
-                            listenerCamera?.onStop()
-                            return@runBlocking
-                        }
-                        getObjectInfo.getResult().getOrNull()?.let { info ->
-                            val name = info.filename?.uppercase() ?: ""
-
-                            session.log.d(TAG, "Full ObjectInfo for handler=$handler: $info")
-
-                            if (info.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
-                                (name.endsWith(".JPG") || name.endsWith(".JPEG"))
-                            ) {
-
-                                // ─────────────────────────────────────
-                                // PHASE 1: EXIF-Based Deduplication
-                                // ─────────────────────────────────────
-
-                                // Check exclusion list BEFORE fetching partial bytes
-                                val exclusionKey = "${handler}::${info.parentObject}"
-                                if (exclusionKey in sessionExclusionList) {
-                                    session.log.d(TAG, "Handler $handler already processed this session; skipping EXIF fetch")
-                                    return@let
-                                }
-
-                                // 1. Fetch only partial bytes for EXIF parsing (64KB)
-                                val partialBytes = fetchPartialBytesForExif(executor, handler, info)
-
-                                // 2. Generate EXIF-based unique key from partial data
-                                val exifKey = if (partialBytes != null) {
-                                    generateExifUniqueKeyFromBytes(partialBytes, info)
-                                } else {
-                                    null // Fallback if partial fetch fails
-                                }
-
-                                // 3. Build composite unique key
-                                val compositeKey = generateCompositeUniqueKey(info, exifKey)
-
-                                // 4. Check if already cached (duplicate detection)
-                                if (cacheImage.containsKey(compositeKey)) {
-                                    session.log.d(
-                                        TAG,
-                                        "Skipping duplicate image with composite key: $compositeKey, Filename=$name"
-                                    )
-                                    // Mark as processed in exclusion list even if duplicate
-                                    sessionExclusionList.add(exclusionKey)
-                                    return@let // ❌ Skip: already cached, don't add again
-                                }
-
-                                // 5. ✅ Unique: Add to cache as CachedImageEntry (metadata only, no image bytes yet)
-                                val entry = CachedImageEntry(info, compositeKey, info.handlerID)
-                                cacheImage[compositeKey] = entry
-
-                                session.log.d(
-                                    TAG,
-                                    "Cached unique image: $name with key: $compositeKey, handler: ${info.handlerID}"
-                                )
-
-                                // Mark as processed in exclusion list after successful caching
-                                sessionExclusionList.add(exclusionKey)
-                                session.log.d(TAG, "Added to exclusion list: $exclusionKey (cached unique)")
-
-                            } else {
-                                session.log.d(
-                                    TAG,
-                                    "Skipping non-JPEG object: $name, Format=${info.objectFormat}"
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // val getCleanHandlers = onHandlersFilterCallback?.invoke(cacheImage.values.toList()) ?: listOf()
-                val filteredEntries = listenerCamera?.onHandlersFilter(cacheImage.values.toList()) ?: listOf()
-
-                val approvedCompositeKeys = filteredEntries.map { it.compositeKey }.toSet()
-
-                session.log.d(
-                    TAG,
-                    "Download phase: ${approvedCompositeKeys.size} approved entries, ${cacheImage.size} cached entries"
-                )
-
-                cacheImage.values.forEach { entry ->
-                    // 🔑 Critical: Check by compositeKey (content-based), BUKAN handlerID
-                    if (entry.compositeKey in approvedCompositeKeys) {
-                        val name = entry.objectInfo.filename?.uppercase() ?: ""
-                        val suffix = if (name.length >= 4) name.takeLast(4) else name
-
-                        session.log.d(
-                            TAG,
-                            "Downloading handler: ${entry.objectInfo.handlerID}, Filename=$name, " +
-                                    "CaptureDate=${entry.objectInfo.captureDate}, Suffix=$suffix, CompositeKey=${entry.compositeKey}"
-                        )
-
-                        // ✅ Download menggunakan handlerId dari entry (bukan dari filter result)
-                        val objectImage = onDownloadImage(executor, entry.handlerId)
-
-                        if (objectImage == null) {
-                            session.log.e(
-                                TAG,
-                                "execute: failed when download image $name (Handler: ${entry.objectInfo.handlerID}, " +
-                                        "CaptureDate=${entry.objectInfo.captureDate}, Suffix=$suffix)"
-                            )
-                            listenerCamera?.onError(Throwable("failed when download image $name, please restart the camera"))
-                            listenerCamera?.onStop()
-                            return@runBlocking
-                        }
-
-                        listenerCamera?.onImageDownloaded(objectImage)
-                    } else {
-                        session.log.d(TAG, "Skipped download (filtered out): ${entry.compositeKey}")
-                    }
-                }
-                finishLoadStorageImage = true
+            val getStorageIds = GetStorageIdsCommand(session)
+            executor.handleCommand(getStorageIds)
+            getStorageIds.getResult().onFailure {
+                session.log.e(TAG, "execute: failed when get storage ids, maybe storage empty. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
+                listenerCamera?.onError(Throwable("failed when get storage ids, please check the sd card"))
+                listenerCamera?.onStop()
+                return@runBlocking
             }
+            val storageIds = getStorageIds.getResult().getOrNull() ?: return@runBlocking
 
-            val getEventCommand = NikonGetEventCommand(session)
-            executor.handleCommand(getEventCommand)
-
-            getEventCommand.getResult().onFailure {
-                session.log.e(TAG, "execute: failed when get event. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
-                listenerCamera?.onError(Throwable("failed when get event"))
+            if (storageIds.isEmpty()) {
+                session.log.e(TAG, "execute: storageIds is empty. Manufacture: ${deviceInfo.manufacture} Model: ${deviceInfo.model} ")
+                listenerCamera?.onError(Throwable("storage ids is empty, please check the sd card"))
                 listenerCamera?.onStop()
                 return@runBlocking
             }
 
-            getEventCommand.getResult().getOrNull()?.forEach { event ->
-                if (event.code.toInt() == PtpConstants.Event.ObjectAdded) {
-                    val handler = event.parameter
-
-                    // ✅ Quick pre-check: skip if handler already processed this session (optimization)
-                    if (cacheImage.values.any { it.handlerId == handler }) {
-                        session.log.d(TAG, "Skipping event handler already processed: $handler")
-                        return@forEach
+            var finishLoadStorageImage = false
+            listenerCamera?.onReady()
+            // Pre-check storage info before looping
+            val validStorageIds = mutableListOf<Int>()
+            storageIds.forEach { storage ->
+                val getStorageInfoCmd = GetStorageInfoCommand(session, storage)
+                session.log.d(TAG, "Checking storage $storage with GetStorageInfoCommand")
+                executor.handleCommand(getStorageInfoCmd)
+                when(getStorageInfoCmd.responseCode) {
+                    PtpConstants.Response.Ok -> {
+                        session.log.d(TAG, "Executed GetStorageInfoCommand for $storage")
+                        val storageInfoResult = getStorageInfoCmd.getResult()
+                        session.log.d(TAG, "Result for $storage: $storageInfoResult")
+                        storageInfoResult.getOrNull()?.let { info ->
+                            session.log.d(TAG, "Storage $storage info: type=${info.storageType}, fsType=${info.filesystemType}, maxCapacity=${info.maxCapacity}, freeSpace=${info.freeSpaceInBytes}")
+                            if (info.maxCapacity > 0) {
+                                validStorageIds.add(storage)
+                                session.log.d(TAG, "Storage $storage is valid with capacity ${info.maxCapacity}")
+                            } else {
+                                session.log.e(TAG, "Storage $storage has maxCapacity=0, skipping")
+                            }
+                        }
                     }
-
-                    val infoCmd = GetObjectInfoCommand(session, handler)
-                    executor.handleCommand(infoCmd)
-
-                    val info = infoCmd.getResult().getOrNull() ?: return@forEach
-                    val name = info.filename?.uppercase() ?: ""
-                    val suffix = if (name.length >= 4) name.takeLast(4) else name
-
-                    session.log.d(TAG, "Processing handler=$handler, Filename=$name, Format=${info.objectFormat}, CaptureDate=${info.captureDate}, Suffix=$suffix, Sequence=${info.sequenceNumber}")
-                    session.log.d(TAG, "Full ObjectInfo for handler=$handler: $info")
-
-                    if (info.objectFormat == MtpConstants.FORMAT_EXIF_JPEG &&
-                        (name.endsWith(".JPG") || name.endsWith(".JPEG"))) {
-
-                        session.log.d(TAG, "Candidate JPEG handler: $handler, Filename=$name, CaptureDate=${info.captureDate}, Suffix=$suffix")
-
-                        // ─────────────────────────────────────
-                        // EXIF-Based Deduplication for Event (SAME as initial scan)
-                        // ─────────────────────────────────────
-
-                        // Check exclusion list BEFORE fetching partial bytes
-                        val exclusionKey = "${handler}::${info.parentObject}"
-                        if (exclusionKey in sessionExclusionList) {
-                            session.log.d(TAG, "Event handler $handler already processed this session; skipping EXIF fetch")
-                            return@forEach
-                        }
-
-                        // 1. Fetch partial bytes for EXIF parsing (64KB)
-                        val partialBytes = fetchPartialBytesForExif(executor, handler, info)
-
-                        // 2. Generate EXIF-based unique key
-                        val exifKey = if (partialBytes != null) {
-                            generateExifUniqueKeyFromBytes(partialBytes, info)
-                        } else {
-                            null // Fallback if partial fetch fails
-                        }
-
-                        // 3. Build composite unique key (content-based, NO handlerID)
-                        val compositeKey = generateCompositeUniqueKey(info, exifKey)
-
-                        // 4. Check if already cached (duplicate detection by CONTENT)
-                        if (cacheImage.containsKey(compositeKey)) {
-                            session.log.d(TAG, "Skipping duplicate event with composite key: $compositeKey, Filename=$name, Suffix=$suffix")
-                            // Mark as processed in exclusion list
-                            sessionExclusionList.add(exclusionKey)
-                            return@forEach // Skip: already cached
-                        }
-
-                        // 5. ✅ Unique: Add to cache as CachedImageEntry
-                        val entry = CachedImageEntry(info, compositeKey, info.handlerID)
-                        cacheImage[compositeKey] = entry
-
-                        session.log.d(TAG, "Cached unique image (event): $name with key: $compositeKey, handler: ${info.handlerID}, Suffix=$suffix")
-
-                        // Mark as processed in exclusion list
-                        sessionExclusionList.add(exclusionKey)
-
-                        val objectImage = onDownloadImage(executor, handler)
-                        if (objectImage == null) {
-                            session.log.e(TAG, "execute: failed when download image $handler")
-                            listenerCamera?.onError(Throwable("failed when download image $handler, please restart the camera"))
-                            listenerCamera?.onStop()
-                            return@runBlocking
-                        }
-                        listenerCamera?.onImageDownloaded(objectImage)
-
-                    } else {
-                        session.log.d(TAG, "Skipping non-JPEG handler: $handler, Filename=$name, Format=${info.objectFormat}, CaptureDate=${info.captureDate}, Suffix=$suffix")
+                    PtpConstants.Response.StoreNotAvailable -> {
+                        session.log.w(TAG, "Storage Not Available id: $storage")
+                    }
+                    else -> {
+                        session.log.e(TAG, "Storage: Cannot populate storage, please check the storage")
+                        listenerCamera?.onError(Throwable("Cannot populate storage, please check the storage"))
+                        listenerCamera?.onStop()
+                        return@runBlocking
                     }
                 }
             }
-        }
-        listenerCamera?.onStop()
-    }
 
-    private fun onConnecting(worker: WorkerExecutor): DeviceInfo? {
-        val closeSessionCommand = CloseSessionCommand(session)
-        worker.handleCommand(closeSessionCommand)
+            while (executor.isRunning()) {
+                // ─────────────────────────────────────
+                // PHASE 1: Initial scan of all storages
+                // ─────────────────────────────────────
+                if (!finishLoadStorageImage) {
+                    for (storage in storageIds) {
+                        processStorageHandlers(executor, storage, deviceInfo)
+                    }
+                    finishLoadStorageImage = true
+                    isSkipAutoUpload = false  // ✅ Enable real-time deduplication after initial scan
+                }
 
-        val openSessionCommand = OpenSessionCommand(session)
-        worker.handleCommand(openSessionCommand)
-
-        val getDeviceInfoCommand = GetDeviceInfoCommand(session)
-        worker.handleCommand(getDeviceInfoCommand)
-
-        val getNikonGetDevicePropCommand = NikonGetDevicePropCommand(session)
-        worker.handleCommand(getNikonGetDevicePropCommand)
-
-        getDeviceInfoCommand.getResult().onFailure {
-            session.log.e(TAG, "onConnecting: failed when get device info")
-        }
-
-        return getDeviceInfoCommand.getResult().getOrNull()
-    }
-
-    private suspend fun onDownloadImage(worker: WorkerExecutor, handler: Int): ObjectImage? {
-        val getObjectInfoCommand =  handlerCommandRetry(session,worker) {
-            GetObjectInfoCommand(session, handler)
+                // ─────────────────────────────────────
+                // PHASE 2: Event-based polling (Nikon)
+                // ─────────────────────────────────────
+                pollForNewEvents(executor, storageIds.toList(), deviceInfo)
+            }
+            listenerCamera?.onStop()
         }
 
-        getObjectInfoCommand.getResult().onFailure {
-            session.log.w(TAG, "onDownloadImage: failed when download info image $handler")
-        }
-        val objectInfo = getObjectInfoCommand.getResult().getOrNull()
+        private fun onConnecting(worker: WorkerExecutor): DeviceInfo? {
+            val closeSessionCommand = CloseSessionCommand(session)
+            worker.handleCommand(closeSessionCommand)
 
-        if (objectInfo == null) {
-            session.log.e(TAG, "onDownloadImage: failed when download info image")
-            return null
-        }
+            val openSessionCommand = OpenSessionCommand(session)
+            worker.handleCommand(openSessionCommand)
 
-        return if (isPartialSupport) {
-            downloadImagePartial(worker, handler, objectInfo)
-        } else {
-            downloadImage(worker, handler, objectInfo)
-        }
-    }
+            val getDeviceInfoCommand = GetDeviceInfoCommand(session)
+            worker.handleCommand(getDeviceInfoCommand)
 
-    private suspend fun downloadImage(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
-        session.log.d(TAG, "downloadImage: start download image $handler")
-        val getObjectCommand =  handlerCommandRetry(session,worker) {
-            GetObjectCommand(session, handler)
-        }
-        getObjectCommand.getResult().onFailure {
-            session.log.w(TAG, "downloadImage: failed when download image data $handler")
-        }
-        val imageObject = getObjectCommand.getResult().getOrNull()
+            val getNikonGetDevicePropCommand = NikonGetDevicePropCommand(session)
+            worker.handleCommand(getNikonGetDevicePropCommand)
 
-        if (imageObject == null) {
-            session.log.d(TAG, "downloadImage: failed when download image data")
-            return null
-        }
-
-        session.log.d(TAG, "downloadImage: finish download image")
-        return ObjectImage(objectInfo, handler, imageObject)
-    }
-
-    private suspend fun downloadImagePartial(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
-//        session.log.d(TAG, "downloadImagePartial: start download image $handler")
-        var offset = 0
-        val totalBytes = objectInfo.objectCompressedSize
-        val imageTotalBytes = ByteBuffer.allocate(totalBytes)
-        imageTotalBytes.position(0)
-        val maxPacketSize =  1024 * 1024
-
-        while(offset < totalBytes) {
-            var size = totalBytes - offset
-            if (size > maxPacketSize) {
-                size = maxPacketSize
+            getDeviceInfoCommand.getResult().onFailure {
+                session.log.e(TAG, "onConnecting: failed when get device info")
             }
 
-            val finalOffset = offset
-            val finalSize = size
-            val partialObjectCommand =  handlerCommandRetry(session,worker) {
-                GetObjectPartial(session, handler, finalOffset, finalSize)
+            return getDeviceInfoCommand.getResult().getOrNull()
+        }
+
+        private suspend fun onDownloadImage(worker: WorkerExecutor, handler: Int): ObjectImage? {
+            val getObjectInfoCommand =  handlerCommandRetry(session,worker) {
+                GetObjectInfoCommand(session, handler)
             }
 
-//            session.log.d(TAG, "downloadImagePartial: consume command")
-            partialObjectCommand.getResult().onFailure {
-                session.log.w(TAG, "downloadImagePartial: failed when download partial image $handler")
+            getObjectInfoCommand.getResult().onFailure {
+                session.log.w(TAG, "onDownloadImage: failed when download info image $handler")
             }
-//            session.log.d(TAG, "downloadImagePartial: consume command done")
+            val objectInfo = getObjectInfoCommand.getResult().getOrNull()
 
-            if (partialObjectCommand.getResult().getOrNull() == null) {
-                session.log.e(TAG, "downloadImagePartial: failed when download partial image")
+            if (objectInfo == null) {
+                session.log.e(TAG, "onDownloadImage: failed when download info image")
                 return null
             }
 
-            val imageBytes = partialObjectCommand.getResult().getOrNull()?.clone() ?: return null
-            imageTotalBytes.put(imageBytes, 0, imageBytes.size)
-
-//            session.log.d(TAG, "downloadImagePartial: download with offset $offset with size $size")
-            offset += size
-
-            if (!worker.isRunning()) {
-                return null
+            return if (isPartialSupport) {
+                downloadImagePartial(worker, handler, objectInfo)
+            } else {
+                downloadImage(worker, handler, objectInfo)
             }
         }
 
-        val imageBytes = imageTotalBytes.array()
-        val bitmapOptions = BitmapFactory.Options()
-        bitmapOptions.inSampleSize = 2
-        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, bitmapOptions)
-
-//        session.log.d(TAG, "downloadImagePartial: finish download image")
-        return ObjectImage(objectInfo, handler, ImageObject(imageBytes, bitmap))
-    }
-
-    private suspend fun <T: Command>handlerCommandRetry(session: Session,worker: WorkerExecutor, getCommand: ()-> T): T {
-        while(worker.isRunning()) {
-            val command = getCommand()
-            worker.handleCommand(command)
-            if(!command.isRetry()) {
-                return command
+        private suspend fun downloadImage(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
+            session.log.d(TAG, "downloadImage: start download image $handler")
+            val getObjectCommand =  handlerCommandRetry(session,worker) {
+                GetObjectCommand(session, handler)
             }
-            session.log.e(TAG, "${command::class.simpleName} request retry")
-            delay(500L)
-        }
-        error("Worker is shutting down")
-    }
+            getObjectCommand.getResult().onFailure {
+                session.log.w(TAG, "downloadImage: failed when download image data $handler")
+            }
+            val imageObject = getObjectCommand.getResult().getOrNull()
 
-    private suspend fun fetchPartialBytesForExif(
-        worker: WorkerExecutor,
-        handler: Int,
-        objectInfo: ObjectInfo
-    ): ByteArray? {
-        return try {
-            // Minimum size check before EXIF parsing attempt
-            if (objectInfo.objectCompressedSize < 128) {
-                session.log.w(TAG, "File too small for EXIF: handler=$handler, size=${objectInfo.objectCompressedSize}")
+            if (imageObject == null) {
+                session.log.d(TAG, "downloadImage: failed when download image data")
                 return null
             }
 
-            val fetchSize = min(64 * 1024, objectInfo.objectCompressedSize)
-            val partialCmd = handlerCommandRetry(session, worker) {
-                GetObjectPartial(session, handler, 0, fetchSize)
+            session.log.d(TAG, "downloadImage: finish download image")
+            return ObjectImage(objectInfo, handler, imageObject)
+        }
+
+        private suspend fun downloadImagePartial(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
+    //        session.log.d(TAG, "downloadImagePartial: start download image $handler")
+            var offset = 0
+            val totalBytes = objectInfo.objectCompressedSize
+            val imageTotalBytes = ByteBuffer.allocate(totalBytes)
+            imageTotalBytes.position(0)
+            val maxPacketSize =  1024 * 1024
+
+            while(offset < totalBytes) {
+                var size = totalBytes - offset
+                if (size > maxPacketSize) {
+                    size = maxPacketSize
+                }
+
+                val finalOffset = offset
+                val finalSize = size
+                val partialObjectCommand =  handlerCommandRetry(session,worker) {
+                    GetObjectPartial(session, handler, finalOffset, finalSize)
+                }
+
+    //            session.log.d(TAG, "downloadImagePartial: consume command")
+                partialObjectCommand.getResult().onFailure {
+                    session.log.w(TAG, "downloadImagePartial: failed when download partial image $handler")
+                }
+    //            session.log.d(TAG, "downloadImagePartial: consume command done")
+
+                if (partialObjectCommand.getResult().getOrNull() == null) {
+                    session.log.e(TAG, "downloadImagePartial: failed when download partial image")
+                    return null
+                }
+
+                val imageBytes = partialObjectCommand.getResult().getOrNull()?.clone() ?: return null
+                imageTotalBytes.put(imageBytes, 0, imageBytes.size)
+
+    //            session.log.d(TAG, "downloadImagePartial: download with offset $offset with size $size")
+                offset += size
+
+                if (!worker.isRunning()) {
+                    return null
+                }
             }
-            partialCmd.getResult().getOrNull()
-        } catch (e: Exception) {
-            session.log.w(TAG, "Failed to fetch partial bytes for EXIF: handler=$handler", e)
-            null
-        }
-    }
 
-    private fun generateCompositeUniqueKey(objectInfo: ObjectInfo, exifUniqueKey: String?): String {
-        val safeExifKey = exifUniqueKey ?: run {
-            // Log warning when falling back to unreliable fields
-            session.log.w(
-                TAG,
-                "EXIF extraction failed for handler ${objectInfo.handlerID}; using fallback key (filename/size/date). Risk: false unique."
-            )
-            // Use unsigned hex for fallback too
-            "${objectInfo.filename}_${objectInfo.objectCompressedSize}_${objectInfo.captureDate}"
-                .hashCode().toUnsignedHex()
-        }
-        //  Use '::' delimiter to avoid collision with hash content
-        return "${objectInfo.storageId}::${objectInfo.parentObject}::$safeExifKey"
-    }
+            val imageBytes = imageTotalBytes.array()
+            val bitmapOptions = BitmapFactory.Options()
+            bitmapOptions.inSampleSize = 2
+            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, bitmapOptions)
 
-    private fun generateExifUniqueKeyFromBytes(partialBytes: ByteArray, objectInfo: ObjectInfo): String? {
-        return try {
-            // Minimum byte check before parsing
-            if (partialBytes.size < 128) {
-                session.log.w(TAG, "Partial bytes too small for EXIF parsing: ${partialBytes.size}")
-                return null
+    //        session.log.d(TAG, "downloadImagePartial: finish download image")
+            return ObjectImage(objectInfo, handler, ImageObject(imageBytes, bitmap))
+        }
+
+        private suspend fun <T: Command>handlerCommandRetry(session: Session,worker: WorkerExecutor, getCommand: ()-> T): T {
+            while(worker.isRunning()) {
+                val command = getCommand()
+                worker.handleCommand(command)
+                if(!command.isRetry()) {
+                    return command
+                }
+                session.log.e(TAG, "${command::class.simpleName} request retry")
+                delay(500L)
+            }
+            error("Worker is shutting down")
+        }
+
+        // Extracted: Process handlers for a single storage
+        private suspend fun processStorageHandlers(
+            executor: WorkerExecutor,
+            storage: Int,
+            deviceInfo: DeviceInfo
+        ) {
+            val getHandlersCommand = handlerCommandRetry(session, executor) {
+                GetObjectHandlesCommand(session, storage, MtpConstants.FORMAT_EXIF_JPEG)
+            }
+            val handlersFromStorage = getHandlersCommand.getResult().getOrNull() ?: IntArray(0)
+
+            val handlerCleanFromRaw = handlersFromStorage.filterNot { localRawDatabase.contains(it) }
+
+            for (handlerId in handlerCleanFromRaw) {
+                // ✅ NEW: Skip if already fully processed (prevents ALL MTP calls)
+                if (processedHandlerIds.contains(handlerId)) {
+                    session.log.d(TAG, "⏭️ Skip handler $handlerId: already processed")
+                    continue
+                }
+
+                // ✅ Quick skip: if already tracked as "no EXIF" by handlerId
+                if (localExifDatabaseNotFound.contains(handlerId.toString())) {
+                    processedHandlerIds.add(handlerId)  // ✅ Mark as processed to avoid re-check
+                    continue
+                }
+
+                // ✅ Process this handler
+                processHandler(executor, handlerId, deviceInfo)
+            }
+        }
+
+        // Extracted: Process a single handler
+        private suspend fun processHandler(
+            executor: WorkerExecutor,
+            handlerId: Int,
+            deviceInfo: DeviceInfo
+        ) {
+            val getObjectInfo = handlerCommandRetry(session, executor) {
+                GetObjectInfoCommand(session, handlerId)
+            }
+            // ✅ Mark as processed even on GetObjectInfo failure
+            val objectInfo = getObjectInfo.getResult().getOrNull() ?: run {
+                processedHandlerIds.add(handlerId)
+                return
             }
 
-            val exif = ExifInterface(ByteArrayInputStream(partialBytes))
+            val name = objectInfo.filename?.uppercase() ?: ""
 
-            val dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
-                ?: ""
+            // ✅ Skip non-JPEG silently but mark as processed
+            if (!(name.endsWith(".JPG") || name.endsWith(".JPEG")) ||
+                objectInfo.objectFormat != MtpConstants.FORMAT_EXIF_JPEG) {
+                processedHandlerIds.add(handlerId)
+                return
+            }
 
-            // Sub-second precision for burst shots
-            val subSec = exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_ORIGINAL)
-                ?: exif.getAttribute("SubSecTimeOriginal")
-                ?: exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_DIGITIZED)
-                ?: exif.getAttribute("SubSecTimeDigitized")
-                ?: ""
+            // ✅ Download image — mark as processed if fails
+            val objectImage = onDownloadImage(executor, handlerId) ?: run {
+                processedHandlerIds.add(handlerId)
+                return
+            }
 
-            val make = exif.getAttribute(ExifInterface.TAG_MAKE) ?: ""
-            val model = exif.getAttribute(ExifInterface.TAG_MODEL) ?: ""
-            val uniqueId = exif.getAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID)
-                ?: exif.getAttribute("ImageUniqueID")
-                ?: ""
+            // ✅ Extract EXIF key
+            val exifKey = extractExifKeyFromImage(executor, handlerId, objectInfo)
 
-            // Deterministic hash
-            val rawKey = "$dateTime|$subSec|$uniqueId|$make|$model|${objectInfo.objectCompressedSize}"
-            rawKey.hashCode().toString(16)
-        } catch (e: Exception) {
-            session.log.w(TAG, "EXIF parse failed for handler ${objectInfo.handlerID}", e)
-            null
+            // ✅ Build wrapper and let app decide
+            val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifKey)
+            val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
+                objectInfoWithExif,
+                isSkipAutoUpload
+            ) ?: false
+
+            // ✅ Route through consume functions for dedup + marking
+            if (isExist) {
+                consumeImageAlreadyTracked(handlerId, exifKey)  // ✅ NEW helper
+            } else {
+                consumeImage(objectImage, exifKey)
+            }
+        }
+
+        // Helper for when app says image already exists
+        private fun consumeImageAlreadyTracked(handlerId: Int, exifKey: String?) {
+            if (exifKey.isNullOrEmpty()) {
+                localExifDatabaseNotFound.add(handlerId.toString())
+            } else {
+                localExifDatabaseExist.add(exifKey)
+            }
+            // ✅ CRITICAL: Mark as processed to skip future polls
+            processedHandlerIds.add(handlerId)
+            session.log.d(TAG, "✅ Tracked existing handler $handlerId (exifKey=${exifKey?.take(30) ?: "null"})")
+        }
+
+        // Extracted: Consume image logic (matches pseudo-code consumeImage function)
+        private suspend fun consumeImage(objectImage: ObjectImage, exifData: String?) {
+            // ✅ Library-side deduplication before calling app callback
+            if (exifData.isNullOrEmpty()) {
+                val fallbackKey = objectImage.handlerId.toString()
+                if (localExifDatabaseNotFound.contains(fallbackKey)) {
+                    session.log.d(TAG, "consumeImage: skip duplicate (no EXIF) handler=${objectImage.handlerId}")
+                    return
+                }
+                localExifDatabaseNotFound.add(fallbackKey)
+            } else {
+                if (localExifDatabaseExist.contains(exifData)) {
+                    session.log.d(TAG, "consumeImage: skip duplicate (with EXIF) key=${exifData.take(50)}")
+                    return
+                }
+                localExifDatabaseExist.add(exifData)
+            }
+
+            // ✅ Pass to app layer for saving
+            listenerCamera?.onImageDownloaded(objectImage)
+
+            // ✅ CRITICAL: Mark handler as fully processed (prevents re-download on next poll)
+            processedHandlerIds.add(objectImage.handlerId)
+            session.log.d(TAG, "✅ Marked handler ${objectImage.handlerId} as processed")
+        }
+
+        // Extracted: Extract EXIF key using partial fetch
+        private suspend fun extractExifKeyFromImage(
+            executor: WorkerExecutor,
+            handler: Int,
+            objectInfo: ObjectInfo
+        ): String? {
+            return try {
+                if (objectInfo.objectCompressedSize < 128) return null
+                val fetchSize = min(64 * 1024, objectInfo.objectCompressedSize)
+                val partialCmd = handlerCommandRetry(session, executor) {
+                    GetObjectPartial(session, handler, 0, fetchSize)
+                }
+                val partialBytes = partialCmd.getResult().getOrNull() ?: return null
+                generateExifUniqueKeyFromBytes(partialBytes, objectInfo)
+            } catch (e: Exception) {
+                session.log.w(TAG, "EXIF extraction failed", e)
+                null
+            }
+        }
+
+        // EXIF signature generator
+        private fun generateExifUniqueKeyFromBytes(partialBytes: ByteArray, objectInfo: ObjectInfo): String? {
+            return try {
+                if (partialBytes.size < 128) return null
+                val exif = ExifInterface(ByteArrayInputStream(partialBytes))
+
+                fun clean(value: String?): String = value?.trim()?.takeIf { it.isNotBlank() } ?: ""
+
+                val make = clean(exif.getAttribute(ExifInterface.TAG_MAKE))
+                val model = clean(exif.getAttribute(ExifInterface.TAG_MODEL))
+                val dateTimeOriginal = clean(exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL))
+
+                // ✅ Subsec: prefer digitized, fallback to original, fallback to "000" if missing from partial fetch
+                val subSecRaw = exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_ORIGINAL)
+                    ?: exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_DIGITIZED)
+                val subSecTime = if (subSecRaw.isNullOrBlank()) {
+                    "000"  // ✅ Placeholder ensures key format consistency even if tag missing in partial fetch
+                } else {
+                    clean(subSecRaw)
+                }
+
+                val uniqueId = clean(
+                    exif.getAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID)
+                        ?: exif.getAttribute("ImageUniqueID")
+                )
+
+                if (model.isEmpty() || dateTimeOriginal.isEmpty()) return null
+
+                // ✅ Key format matches Canon: Make_Model_DateTime_SubSec_UniqueId
+                return "${make}_${model}_${dateTimeOriginal}_${subSecTime}_${uniqueId}"
+            } catch (e: Exception) {
+                session.log.w(TAG, "EXIF parse failed", e)
+                null
+            }
+        }
+
+        // Extracted: Poll for Nikon events (re-uses processStorageHandlers)
+        private suspend fun pollForNewEvents(
+            executor: WorkerExecutor,
+            storageIds: List<Int>,
+            deviceInfo: DeviceInfo
+        ) {
+            val getEventCommand = NikonGetEventCommand(session)
+            executor.handleCommand(getEventCommand)
+
+            getEventCommand.getResult().getOrNull()?.forEach { event ->
+                if (event.code.toInt() == PtpConstants.Event.ObjectAdded) {
+                    val handlerId = event.parameter
+
+                    // ✅ Quick skip: if already tracked as raw, no-EXIF, OR fully processed
+                    if (localRawDatabase.contains(handlerId) ||
+                        localExifDatabaseNotFound.contains(handlerId.toString()) ||
+                        processedHandlerIds.contains(handlerId)) {
+                        return@forEach
+                    }
+
+                    processHandler(executor, handlerId, deviceInfo)
+                }
+            }
+        }
+
+        companion object {
+            private const val TAG = "NikonCamera"
         }
     }
-
-    private fun Int.toUnsignedHex(): String = this.toUInt().toString(16)
-
-    companion object {
-        private const val TAG = "NikonCamera"
-    }
-}
