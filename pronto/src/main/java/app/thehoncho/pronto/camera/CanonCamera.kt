@@ -455,7 +455,6 @@ class CanonCamera(
 
     // Update consumeImage to mark handler as processed:
     private suspend fun consumeImage(objectImage: ObjectImage, exifData: String?) {
-        // ✅ Library-side deduplication before calling app callback
         if (exifData.isNullOrEmpty()) {
             val fallbackKey = objectImage.handlerId.toString()
             if (localExifDatabaseNotFound.contains(fallbackKey)) {
