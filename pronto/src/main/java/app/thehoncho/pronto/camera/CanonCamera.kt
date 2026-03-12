@@ -378,37 +378,6 @@ class CanonCamera(
 
         val name = objectInfo.filename?.uppercase() ?: ""
 
-//        // ✅ Allow-list: Only process known IMAGE formats
-//        val isSupportedFormat = when (objectInfo.objectFormat) {
-//            MtpConstants.FORMAT_EXIF_JPEG,
-//            MtpConstants.FORMAT_JFIF -> name.endsWith(".JPG") || name.endsWith(".JPEG")
-//
-//            // Canon RAW formats (check if these constants exist in your MTP lib)
-//            0x380B2,  // FORMAT_CR2 (Canon RAW v2) - common value
-//            0x380B3,  // FORMAT_CR3 (Canon RAW v3)
-//                -> name.endsWith(".CR2") || name.endsWith(".CR3") || name.endsWith(".CRW")
-//
-//            // Nikon RAW
-//            0x380B4,  // FORMAT_NEF
-//                -> name.endsWith(".NEF")
-//
-//            // Sony RAW
-//            0x380B5,  // FORMAT_ARW
-//                -> name.endsWith(".ARW") || name.endsWith(".SR2")
-//
-//            // Adobe DNG (universal RAW)
-//            MtpConstants.FORMAT_DNG -> name.endsWith(".DNG")
-//
-//            // Fallback: trust filename extension if format code is unknown
-//            else -> isKnownRawExtension(name)
-//        }
-//
-//        if (!isSupportedFormat) {
-//            session.log.d(TAG, "⏭️ Skipping unsupported format: ${objectInfo.filename} (code: 0x${objectInfo.objectFormat.toString(16)})")
-//            processedHandlerIds.add(handlerId)  // ✅ Mark as processed to avoid retry
-//            return
-//        }
-
         // ✅ Skip non-JPEG silently but mark as processed
         if (!(name.endsWith(".JPG") || name.endsWith(".JPEG")) ||
             objectInfo.objectFormat != MtpConstants.FORMAT_EXIF_JPEG) {
@@ -508,13 +477,6 @@ class CanonCamera(
         processedHandlerIds.add(objectImage.handlerId)
         session.log.d(TAG, "✅ Marked handler ${objectImage.handlerId} as processed")
     }
-
-//    // Helper: Check filename extension for known RAW formats
-//    private fun isKnownRawExtension(filename: String): Boolean {
-//        return filename.endsWith(".CR2") || filename.endsWith(".CR3") || filename.endsWith(".CRW") ||
-//                filename.endsWith(".NEF") || filename.endsWith(".ARW") || filename.endsWith(".SR2") ||
-//                filename.endsWith(".ORF") || filename.endsWith(".RAF") || filename.endsWith(".DNG")
-//    }
 
     companion object {
         private const val TAG = "CanonCamera"
