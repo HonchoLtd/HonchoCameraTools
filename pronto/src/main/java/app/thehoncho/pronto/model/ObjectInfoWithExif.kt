@@ -1,7 +1,7 @@
 package app.thehoncho.pronto.model
 
 /**
- * Minimal wrapper for database deduplication check (matches iOS ObjectInfoWithExif)
+ * Minimal wrapper for database deduplication check
  * Library passes this to app layer; app decides how to build unique key
  */
 data class ObjectImageWithExif(
