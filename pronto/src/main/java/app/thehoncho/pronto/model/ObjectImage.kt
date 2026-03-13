@@ -4,5 +4,5 @@ data class ObjectImage(
     val objectInfo: ObjectInfo,
     val handlerId: Int,
     val image: ImageObject,
-    val exifKey: String? = null  // ✅ Optional, for app-layer deduplication
+    val exifKey: String? = null
 )

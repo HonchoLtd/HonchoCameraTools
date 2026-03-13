@@ -96,6 +96,18 @@ class DeviceInfo {
         return b.toString()
     }
 
+    fun getID(): String {
+        val parts = listOf(
+            standardVersion.toString(),
+            vendorExtensionId.toString(),
+            manufacture ?: "",
+            model ?: "",
+            deviceVersion ?: "",
+            serialNumber ?: ""
+        )
+        return parts.joinToString(separator = "").replace("\u0000", "")
+    }
+
     companion object {
         private fun appendU16Array(b: StringBuilder, name: String, cl: Class<*>, a: IntArray) {
             Arrays.sort(a)

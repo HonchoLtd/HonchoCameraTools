@@ -77,4 +77,17 @@ class ObjectInfo(b: ByteBuffer, length: Int) {
         b.append("Keywords: ").append(keywords).append('\n')
         return b.toString()
     }
+
+    fun getID(): String {
+        val parts = listOf(
+            handlerID.toString(),
+            storageId.toString(),
+            objectFormat.toString(),
+            parentObject.toString(),
+            captureDate ?: "",
+            modificationDate ?: "",
+            filename ?: ""
+        )
+        return parts.joinToString(separator = ".").replace("\u0000", "")
+    }
 }

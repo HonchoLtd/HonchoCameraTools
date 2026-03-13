@@ -48,10 +48,6 @@ class CameraWorker(
     private var worker: Worker? = null
     private var sonyImage = 0
 
-    // ✅ Simple in-memory tracking (session-only, no DB)
-    private val processedHandlerIds = mutableSetOf<String>()
-    private val processedExifKeys = mutableSetOf<String>()
-
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(p0: Context, p1: Intent) {
             if (UsbManager.ACTION_USB_DEVICE_DETACHED == p1.action) {
@@ -134,24 +130,7 @@ class CameraWorker(
                             objectInfoWithExif: ObjectImageWithExif,
                             isSkipAutoUpload: Boolean
                         ): Boolean {
-                            val exifKey = objectInfoWithExif.exifKey
-                            val fallbackId = objectInfoWithExif.objectInfo.handlerID.toString()
-
-                            // ✅ First-sync: skip images we've already seen this session
-                            if (isSkipAutoUpload) {
-                                return if (!exifKey.isNullOrEmpty()) {
-                                    processedExifKeys.contains(exifKey)
-                                } else {
-                                    processedHandlerIds.contains(fallbackId)
-                                }
-                            }
-
-                            // ✅ Real-time: check and track (same logic as before)
-                            return if (!exifKey.isNullOrEmpty()) {
-                                if (processedExifKeys.contains(exifKey)) true else { processedExifKeys.add(exifKey); false }
-                            } else {
-                                if (processedHandlerIds.contains(fallbackId)) true else { processedHandlerIds.add(fallbackId); false }
-                            }
+                            return false
                         }
 
                         override suspend fun onImageDownloaded(objectImage: ObjectImage) {
@@ -200,24 +179,7 @@ class CameraWorker(
                             objectInfoWithExif: ObjectImageWithExif,
                             isSkipAutoUpload: Boolean
                         ): Boolean {
-                            val exifKey = objectInfoWithExif.exifKey
-                            val fallbackId = objectInfoWithExif.objectInfo.handlerID.toString()
-
-                            // ✅ First-sync: skip images we've already seen this session
-                            if (isSkipAutoUpload) {
-                                return if (!exifKey.isNullOrEmpty()) {
-                                    processedExifKeys.contains(exifKey)
-                                } else {
-                                    processedHandlerIds.contains(fallbackId)
-                                }
-                            }
-
-                            // ✅ Real-time: check and track (same logic as before)
-                            return if (!exifKey.isNullOrEmpty()) {
-                                if (processedExifKeys.contains(exifKey)) true else { processedExifKeys.add(exifKey); false }
-                            } else {
-                                if (processedHandlerIds.contains(fallbackId)) true else { processedHandlerIds.add(fallbackId); false }
-                            }
+                            return false
                         }
 
                         override suspend fun onImageDownloaded(objectImage: ObjectImage) {
@@ -265,24 +227,7 @@ class CameraWorker(
                             objectInfoWithExif: ObjectImageWithExif,
                             isSkipAutoUpload: Boolean
                         ): Boolean {
-                            val exifKey = objectInfoWithExif.exifKey
-                            val fallbackId = objectInfoWithExif.objectInfo.handlerID.toString()
-
-                            // ✅ First-sync: skip images we've already seen this session
-                            if (isSkipAutoUpload) {
-                                return if (!exifKey.isNullOrEmpty()) {
-                                    processedExifKeys.contains(exifKey)
-                                } else {
-                                    processedHandlerIds.contains(fallbackId)
-                                }
-                            }
-
-                            // ✅ Real-time: check and track (same logic as before)
-                            return if (!exifKey.isNullOrEmpty()) {
-                                if (processedExifKeys.contains(exifKey)) true else { processedExifKeys.add(exifKey); false }
-                            } else {
-                                if (processedHandlerIds.contains(fallbackId)) true else { processedHandlerIds.add(fallbackId); false }
-                            }
+                            return false
                         }
 
                         override suspend fun onImageDownloaded(objectImage: ObjectImage) {
