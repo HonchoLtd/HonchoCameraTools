@@ -1,5 +1,6 @@
 package app.thehoncho.pronto.camera
 
+import android.mtp.MtpConstants
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.WorkerExecutor
 import app.thehoncho.pronto.command.general.CloseSessionCommand
@@ -43,6 +44,8 @@ class SonyCamera(private val session: Session): BaseCamera() {
         "ILCE-7C",
     )
 
+    private val processedExifKeys = mutableSetOf<String>()
+
     override fun execute(executor: WorkerExecutor) = runBlocking {
         val deviceInfo = onConnecting(executor)
         if (deviceInfo == null) {
@@ -75,7 +78,6 @@ class SonyCamera(private val session: Session): BaseCamera() {
                 return@runBlocking
             }
             val eventCheckContent = eventCheckCommand.getResult().getOrNull() ?: listOf()
-
             if (checkInMemoryImage(eventCheckContent, deviceInfo)) {
                 val objectImage = onDownloadImage(executor, globalHandlerID)
                 if (objectImage == null) {
@@ -86,8 +88,49 @@ class SonyCamera(private val session: Session): BaseCamera() {
                         return@runBlocking
                     }
                 }
-                objectImage?.let { listenerCamera?.onImageDownloaded(it) }
-                session.log.d(TAG, "getCommand: finish download image")
+
+                // FILTER: Extension-based JPEG check + EXIF dedup ─
+                objectImage?.let { image ->
+                    val filename = image.objectInfo.filename ?: "unknown"
+
+                    // JPEG-ONLY FILTER (Extension Check)
+                    // Requirement: Check file extension (.jpg / .jpeg)
+                    val hasJpegExtension = filename.endsWith(".JPEG", ignoreCase = true) ||
+                            filename.endsWith(".JPG", ignoreCase = true)
+
+                    val hasJpegFormat = image.objectInfo.objectFormat == MtpConstants.FORMAT_EXIF_JPEG
+
+                    val isJpeg = hasJpegExtension && hasJpegFormat
+
+                    if (!isJpeg) {
+                        // 🗑️ NOT JPEG Discard immediately
+                        session.log.d(
+                            TAG,
+                            "🗑️ Discarded non-JPEG | filename=$filename | ext=${hasJpegExtension} | format=${hasJpegFormat} | handler=${image.handlerId}"
+                        )
+                        return@let
+                    }
+
+
+                    // EXIF-BASED DEDUPLICATION
+                    val exifKey = generateExifUniqueKeyFromBytes(image)
+
+                    if (exifKey != null) {
+                        // Check if we've already processed this EXIF signature
+                        if (!processedExifKeys.add(exifKey)) {
+                            // Returns false if item already exists
+                            session.log.d(TAG, "⏭️ Duplicate EXIF | filename=$filename | key=${exifKey.take(40)}...")
+                            return@let
+                        }
+                    } else {
+                        // No EXIF available: log warning but proceed (fallback)
+                        session.log.w(TAG, "⚠️ No EXIF key | filename=$filename | saving anyway")
+                    }
+
+                    // VALID JPEG + NOT DUPLICATE: SAVE IT
+                    session.log.d(TAG, "✅ Saved JPEG | filename=$filename | handler=${image.handlerId}")
+                    listenerCamera?.onImageDownloaded(image)
+                }
             } else {
                 delay(3000)
             }
@@ -243,6 +286,37 @@ class SonyCamera(private val session: Session): BaseCamera() {
     }
 
 
+    private fun generateExifUniqueKeyFromBytes(objectImage: ObjectImage): String? {
+        return try {
+            val imageBytes = objectImage.image.bytes
+            if (imageBytes.size < 128) return null // Too small for valid EXIF
+
+            val exif = android.media.ExifInterface(java.io.ByteArrayInputStream(imageBytes))
+
+            fun clean(value: String?): String = value?.trim()?.takeIf { it.isNotBlank() } ?: ""
+
+            val make = clean(exif.getAttribute(android.media.ExifInterface.TAG_MAKE))
+            val model = clean(exif.getAttribute(android.media.ExifInterface.TAG_MODEL))
+            val dateTimeOriginal = clean(exif.getAttribute(android.media.ExifInterface.TAG_DATETIME_ORIGINAL))
+            val subSecDigitized = clean(exif.getAttribute(android.media.ExifInterface.TAG_SUBSEC_TIME_DIGITIZED))
+            val subSecOriginal = clean(exif.getAttribute(android.media.ExifInterface.TAG_SUBSEC_TIME_ORIGINAL))
+            val subSecTime = if (subSecDigitized.isNotEmpty()) subSecDigitized else subSecOriginal
+            val uniqueId = clean(
+                exif.getAttribute(android.media.ExifInterface.TAG_IMAGE_UNIQUE_ID)
+                    ?: exif.getAttribute("ImageUniqueID")
+            )
+
+            // Require at least model + dateTime for a valid key
+            if (model.isEmpty() || dateTimeOriginal.isEmpty()) return null
+
+            // Build unique signature
+            return "${make}_${model}_${dateTimeOriginal}_${subSecTime}_${uniqueId}"
+
+        } catch (e: Exception) {
+            session.log.w(TAG, "❌ EXIF parse failed | filename=${objectImage.objectInfo.filename} | error=${e.message}", e)
+            null
+        }
+    }
 
     companion object {
         private const val TAG = "SonyCamera"
