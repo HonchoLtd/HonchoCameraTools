@@ -328,35 +328,19 @@ class CanonCamera(
         // 🧹 Filter handlers through deduplication layers
         val handlerCleanFromRaw = handlersFromStorage.filter {
             val skipped = localRawDatabase.contains(it)
-            if (skipped) internalSession.log.d(
-                "DEBUG_DEDUP_LIB",
-                "⏭️ Filter: Skipping handler $it - in localRawDatabase"
-            )
             !skipped
         }
 
         val handlerCleanExifExist = handlerCleanFromRaw.filter {
             val skipped = localExifDatabaseExist.contains(it.toString())
-            if (skipped) internalSession.log.d(
-                "DEBUG_DEDUP_LIB",
-                "⏭️ Filter: Skipping handler $it - EXIF key in localExifDatabaseExist"
-            )
             !skipped
         }
 
         val handlerFinalClean = handlerCleanExifExist.filter {
             val skipped = localExifDatabaseNotFound.contains(it.toString())
-            if (skipped) internalSession.log.d(
-                "DEBUG_DEDUP_LIB",
-                "⏭️ Filter: Skipping handler $it - handler ID in localExifDatabaseNotFound"
-            )
             !skipped
         }
 
-        internalSession.log.d(
-            "DEBUG_DEDUP_LIB",
-            "📊 Filter Summary: ${handlersFromStorage.size} → ${handlerFinalClean.size} handlers (skipped: ${handlersFromStorage.size - handlerFinalClean.size})"
-        )
 
         for (handlerId in handlerFinalClean) {
             val getObjectInfoCommand = handlerCommandRetry(internalSession, executor) {
@@ -370,11 +354,6 @@ class CanonCamera(
             if ((filename.endsWith(".JPEG") || filename.endsWith(".JPG")) &&
                 objectInfo.objectFormat == MtpConstants.FORMAT_EXIF_JPEG
             ) {
-                internalSession.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "🔍 Checking image | handler=$handlerId | filename=${objectInfo.filename} | format=0x${objectInfo.objectFormat.toString(16)}"
-                )
-
                 val objectImage = onDownloadImage(executor, handlerId) ?: continue
 
                 // ✅ Extract EXIF from the downloaded image
@@ -386,21 +365,12 @@ class CanonCamera(
                 // ✅ Use original objectInfo for dedup check (library interface)
                 val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifData)
 
-                internalSession.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "🔄 Calling onIsImageAlreadyInDatabase | filename=${objectInfo.filename} | exifKey=${exifData?.take(30) ?: "NULL"} | skipUpload=$skipAutoUpload"
-                )
-
                 val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
                     objectInfoWithExif,
                     skipAutoUpload
                 ) ?: false
 
                 if (isExist) {
-                    internalSession.log.d(
-                        "DEBUG_DEDUP_LIB",
-                        "✅ DUPLICATE - Skipping | filename=${objectInfo.filename} | handler=$handlerId"
-                    )
                     // 🗂️ Update dedup caches
                     if (exifData.isNullOrEmpty()) {
                         localExifDatabaseNotFound.add(handlerId.toString())
@@ -408,55 +378,32 @@ class CanonCamera(
                         localExifDatabaseExist.add(exifData)
                     }
                 } else {
-                    internalSession.log.d(
-                        "DEBUG_DEDUP_LIB",
-                        "🆕 NEW IMAGE - Will consume | filename=${objectInfo.filename} | handler=$handlerId"
-                    )
                     consumeImage(enrichedImage)
                 }
             } else {
                 // 🚫 Mark non-JPEG/unsupported formats to skip in future scans
-                internalSession.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "⏭️ Non-JPEG - Skipping | filename=${objectInfo.filename} | handler=$handlerId | format=0x${objectInfo.objectFormat.toString(16)}"
-                )
                 localRawDatabase.add(handlerId)
             }
         }
         return true
     }
 
-    private suspend fun extractExifSignaturePartial(objectImage: ObjectImage): String? {
+    private fun extractExifSignaturePartial(objectImage: ObjectImage): String? {
         return try {
             val exifKey = generateExifUniqueKeyFromBytes(objectImage)
-
-            session.log.d(
-                "DEBUG_DEDUP_LIB",
-                "🔑 EXIF Extracted | handler=${objectImage.handlerId} | filename=${objectImage.objectInfo.filename} | exifKey=${exifKey?.take(40) ?: "NULL"}"
-            )
             return exifKey
 
         } catch (e: Exception) {
-            session.log.w(
-                "DEBUG_DEDUP_LIB",
-                "❌ EXIF: Exception | handler=${objectImage.handlerId} | filename=${objectImage.objectInfo.filename} | error=${e.message}",
-                e
-            )
             null
         }
     }
 
     private fun generateExifUniqueKeyFromBytes(objectImage: ObjectImage): String? {
         return try {
-            val objectInfo = objectImage.objectInfo
             val imageBytes = objectImage.image.bytes
 
             // Quick size check before EXIF parsing
             if (imageBytes.size < 128) {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "⚠️ SKIP EXIF: File too small | handler=${objectImage.handlerId} | filename=${objectInfo.filename} | size=${imageBytes.size}"
-                )
                 return null
             }
 
@@ -479,26 +426,13 @@ class CanonCamera(
             )
 
             if (model.isEmpty() || dateTimeOriginal.isEmpty()) {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "⚠️ EXIF: Missing required fields | model=$model | dateTime=$dateTimeOriginal | filename=${objectInfo.filename}"
-                )
                 return null
             }
 
             val key = "${make}_${model}_${dateTimeOriginal}_${subSecTime}_${uniqueId}"
-            session.log.d(
-                "DEBUG_DEDUP_LIB",
-                "✅ EXIF Key Generated | filename=${objectInfo.filename} | key=${key.take(60)}..."
-            )
             return key
 
         } catch (e: Exception) {
-            session.log.w(
-                "DEBUG_DEDUP_LIB",
-                "❌ EXIF: Parse failed | filename=${objectImage.objectInfo.filename} | error=${e.message}",
-                e
-            )
             null
         }
     }
@@ -510,31 +444,15 @@ class CanonCamera(
 
         if (exifData.isNullOrEmpty()) {
             if (!localExifDatabaseNotFound.contains(objectImage.handlerId.toString())) {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "📥 consumeImage: No EXIF - Adding handler to skip set | filename=$filename | handler=${objectImage.handlerId}"
-                )
                 localExifDatabaseNotFound.add(objectImage.handlerId.toString())
                 listenerCamera?.onImageDownloaded(objectImage)
             } else {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "⏭️ consumeImage: Handler already in skip set - skipping callback | filename=$filename | handler=${objectImage.handlerId}"
-                )
             }
         } else {
             if (!localExifDatabaseExist.contains(exifData)) {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "📥 consumeImage: Has EXIF - Adding key to skip set | filename=$filename | exifKey=${exifData.take(40)}..."
-                )
                 localExifDatabaseExist.add(exifData)
                 listenerCamera?.onImageDownloaded(objectImage)
             } else {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "⏭️ consumeImage: EXIF key already in skip set - skipping callback | filename=$filename | exifKey=${exifData.take(40)}..."
-                )
             }
         }
     }

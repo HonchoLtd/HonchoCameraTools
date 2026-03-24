@@ -134,12 +134,10 @@ class NikonCamera(
             getEventCommand.getResult().getOrNull()?.forEach { event ->
                 if (event.code.toInt() == PtpConstants.Event.ObjectAdded) {
                     val handlerId = event.parameter
-                    session.log.d("DEBUG_DEDUP_LIB", "🔔 PHASE2: ObjectAdded event | handler=$handlerId")
 
                     // Quick skip only for known non-JPEG or known no-EXIF
                     if (localRawDatabase.contains(handlerId) ||
                         localExifDatabaseNotFound.contains(handlerId.toString())) {
-                        session.log.d("DEBUG_DEDUP_LIB", "⏭️ PHASE2: Pre-skipped handler | handler=$handlerId | reason=known_non_jpeg_or_no_exif")
                         return@forEach
                     }
 
@@ -292,18 +290,9 @@ class NikonCamera(
         // 🔹 Skip non-JPEG, track in raw database
         if (!(filename.endsWith(".JPG") || filename.endsWith(".JPEG")) ||
             objectInfo.objectFormat != MtpConstants.FORMAT_EXIF_JPEG) {
-            internalSession.log.d(
-                "DEBUG_DEDUP_LIB",
-                "⏭️ Non-JPEG - Skipping | handler=$handlerId | filename=${objectInfo.filename}"
-            )
             localRawDatabase.add(handlerId)
             return false
         }
-
-        internalSession.log.d(
-            "DEBUG_DEDUP_LIB",
-            "🔍 Processing image | handler=$handlerId | filename=${objectInfo.filename}"
-        )
 
         // 🔹 Download image
         val objectImage = onDownloadImage(executor, handlerId) ?: return false
@@ -321,16 +310,8 @@ class NikonCamera(
             skipAutoUpload
         ) ?: false
 
-        internalSession.log.d(
-            "DEBUG_DEDUP_LIB",
-            "🔄 Database check | filename=${objectInfo.filename} | exifKey=${exifData?.take(30) ?: "NULL"} | exist=$isExist"
-        )
 
         if (isExist) {
-            internalSession.log.d(
-                "DEBUG_DEDUP_LIB",
-                "✅ DUPLICATE - Skipping | filename=${objectInfo.filename} | handler=$handlerId"
-            )
             // 🗂️ Update dedup caches
             if (exifData.isNullOrEmpty()) {
                 localExifDatabaseNotFound.add(handlerId.toString())
@@ -338,10 +319,6 @@ class NikonCamera(
                 localExifDatabaseExist.add(exifData)
             }
         } else {
-            internalSession.log.d(
-                "DEBUG_DEDUP_LIB",
-                "🆕 NEW IMAGE - Will consume | filename=${objectInfo.filename} | handler=$handlerId"
-            )
             consumeImage(enrichedImage)  // ✅ Pass enriched object
         }
         return true
@@ -408,10 +385,6 @@ class NikonCamera(
                 }
             } else {
                 // 🚫 Mark non-JPEG/unsupported formats to skip in future scans
-                internalSession.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "⏭️ Non-JPEG - Skipping | filename=${objectInfo.filename} | handler=$handlerId | format=0x${objectInfo.objectFormat.toString(16)}"
-                )
                 localRawDatabase.add(handlerId)
             }
         }
@@ -441,18 +414,9 @@ class NikonCamera(
         return try {
             val exifKey = generateExifUniqueKeyFromBytes(objectImage)
 
-            session.log.d(
-                "DEBUG_DEDUP_LIB",
-                "🔑 EXIF Extracted | handler=${objectImage.handlerId} | filename=${objectImage.objectInfo.filename} | exifKey=${exifKey?.take(40) ?: "NULL"}"
-            )
             return exifKey
 
         } catch (e: Exception) {
-            session.log.w(
-                "DEBUG_DEDUP_LIB",
-                "❌ EXIF: Exception | handler=${objectImage.handlerId} | filename=${objectImage.objectInfo.filename} | error=${e.message}",
-                e
-            )
             null
         }
     }
@@ -463,10 +427,6 @@ class NikonCamera(
             val imageBytes = objectImage.image.bytes
 
             if (imageBytes.size < 128) {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "⚠️ SKIP EXIF: File too small | handler=${objectImage.handlerId} | filename=${objectInfo.filename} | size=${imageBytes.size}"
-                )
                 return null
             }
 
@@ -485,26 +445,15 @@ class NikonCamera(
             )
 
             if (model.isEmpty() || dateTimeOriginal.isEmpty()) {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "⚠️ EXIF: Missing required fields | model=$model | dateTime=$dateTimeOriginal | filename=${objectInfo.filename}"
-                )
                 return null
             }
 
             val key = "${make}_${model}_${dateTimeOriginal}_${subSecTime}_${uniqueId}"
-            session.log.d(
-                "DEBUG_DEDUP_LIB",
-                "✅ EXIF Key Generated | filename=${objectInfo.filename} | key=${key.take(60)}..."
-            )
+
             return key
 
         } catch (e: Exception) {
-            session.log.w(
-                "DEBUG_DEDUP_LIB",
-                "❌ EXIF: Parse failed | filename=${objectImage.objectInfo.filename} | error=${e.message}",
-                e
-            )
+
             null
         }
     }
