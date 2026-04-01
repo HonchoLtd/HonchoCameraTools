@@ -1,6 +1,6 @@
 package app.thehoncho.pronto.camera
 
-import android.mtp.MtpConstants
+import androidx.exifinterface.media.ExifInterface
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.WorkerExecutor
 import app.thehoncho.pronto.command.general.CloseSessionCommand
@@ -15,24 +15,25 @@ import app.thehoncho.pronto.command.sony.SonyRequestPCModeSecond
 import app.thehoncho.pronto.command.sony.SonyRequestPCModeThird
 import app.thehoncho.pronto.model.DeviceInfo
 import app.thehoncho.pronto.model.ObjectImage
+import app.thehoncho.pronto.model.ObjectImageWithExif
 import app.thehoncho.pronto.model.ObjectInfo
 import app.thehoncho.pronto.model.sony.SonyDevicePropDesc
-import app.thehoncho.pronto.utils.PacketUtil
 import app.thehoncho.pronto.utils.PtpConstants
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import java.lang.Integer.max
-import java.nio.ByteBuffer
+import java.io.ByteArrayInputStream
 import java.nio.ByteOrder
 
-class SonyCamera(private val session: Session): BaseCamera() {
+class SonyCamera(private val session: Session) : BaseCamera() {
     private var isPartialSupport = false
     private var devicePropsDescMap = mutableMapOf<Short, SonyDevicePropDesc>()
-    private var globalHandlerID = -16383 // This my guess 01 c0 ff ff
-    // private var globalHandlerID: Long = 0xffffc001 // This from the gPhoto2
+    private var globalHandlerID = -16383
     private var _deviceInfo: DeviceInfo? = null
 
-    // this list camera that give value < 0 or minus not the 1
+    private val localExifDatabaseExist = mutableSetOf<String>()
+    private var isSkipAutoUpload = true
+
+    // Models that return negative values for pending image flag
     private val minus0List = listOf(
         "ILCE-7SM2",
         "ILCE-7M3",
@@ -44,8 +45,6 @@ class SonyCamera(private val session: Session): BaseCamera() {
         "ILCE-7C",
     )
 
-    private val processedExifKeys = mutableSetOf<String>()
-
     override fun execute(executor: WorkerExecutor) = runBlocking {
         val deviceInfo = onConnecting(executor)
         if (deviceInfo == null) {
@@ -55,7 +54,6 @@ class SonyCamera(private val session: Session): BaseCamera() {
             return@runBlocking
         }
         listenerCamera?.onDeviceConnected(deviceInfo)
-        // onDeviceInfoCallback?.invoke(deviceInfo)
         _deviceInfo = deviceInfo
 
         deviceInfo.operationsSupported.forEach { opt ->
@@ -66,121 +64,86 @@ class SonyCamera(private val session: Session): BaseCamera() {
         }
 
         requestPtpMode(executor)
-
         listenerCamera?.onReady()
+
+        var isFirstLoop = true
+
         while (executor.isRunning()) {
             val eventCheckCommand = SonyEventCheckCommand(session)
             executor.handleCommand(eventCheckCommand)
+
             eventCheckCommand.getResult().onFailure {
                 session.log.w(TAG, "execute: failed when get event check")
                 listenerCamera?.onError(Throwable("failed when get event check, please restart the camera"))
                 listenerCamera?.onStop()
                 return@runBlocking
             }
-            val eventCheckContent = eventCheckCommand.getResult().getOrNull() ?: listOf()
-            if (checkInMemoryImage(eventCheckContent, deviceInfo)) {
+
+            val eventCheckContent = eventCheckCommand.getResult().getOrNull() ?: listOf<SonyDevicePropDesc>()
+            val hasNewImage = checkInMemoryImage(eventCheckContent, deviceInfo)
+
+            if (hasNewImage) {
                 val objectImage = onDownloadImage(executor, globalHandlerID)
                 if (objectImage == null) {
-                    if (deviceInfo.model != "ILCE-7M4") {
-                        session.log.e(TAG, "getCommand: failed when download image")
-                        listenerCamera?.onError(Throwable("failed when download image"))
-                        listenerCamera?.onStop()
-                        return@runBlocking
-                    }
+                    session.log.e(TAG, "getCommand: failed when download image")
+                    continue
                 }
 
-                // FILTER: Extension-based JPEG check + EXIF dedup ─
-                objectImage?.let { image ->
-                    val filename = image.objectInfo.filename ?: "unknown"
+                session.log.d(TAG, "✅ Download success | filename: ${objectImage.objectInfo.filename}")
 
-                    // JPEG-ONLY FILTER (Extension Check)
-                    // Requirement: Check file extension (.jpg / .jpeg)
-                    val hasJpegExtension = filename.endsWith(".JPEG", ignoreCase = true) ||
-                            filename.endsWith(".JPG", ignoreCase = true)
-
-                    val hasJpegFormat = image.objectInfo.objectFormat == MtpConstants.FORMAT_EXIF_JPEG
-
-                    val isJpeg = hasJpegExtension && hasJpegFormat
-
-                    if (!isJpeg) {
-                        // 🗑️ NOT JPEG Discard immediately
-                        session.log.d(
-                            TAG,
-                            "🗑️ Discarded non-JPEG | filename=$filename | ext=${hasJpegExtension} | format=${hasJpegFormat} | handler=${image.handlerId}"
-                        )
-                        return@let
-                    }
-
-
-                    // EXIF-BASED DEDUPLICATION
-                    val exifKey = generateExifUniqueKeyFromBytes(image)
-
-                    if (exifKey != null) {
-                        // Check if we've already processed this EXIF signature
-                        if (!processedExifKeys.add(exifKey)) {
-                            // Returns false if item already exists
-                            session.log.d(TAG, "⏭️ Duplicate EXIF | filename=$filename | key=${exifKey.take(40)}...")
-                            return@let
-                        }
-                    } else {
-                        // No EXIF available: log warning but proceed (fallback)
-                        session.log.w(TAG, "⚠️ No EXIF key | filename=$filename | saving anyway")
-                    }
-
-                    // VALID JPEG + NOT DUPLICATE: SAVE IT
-                    session.log.d(TAG, "✅ Saved JPEG | filename=$filename | handler=${image.handlerId}")
-                    listenerCamera?.onImageDownloaded(image)
+                // Skip non-JPEG images
+                if (objectImage.objectInfo.objectFormat != PtpConstants.ObjectFormat.EXIF_JPEG) {
+                    session.log.d(TAG, "⚠️ Not JPEG, skip | format=0x${objectImage.objectInfo.objectFormat.toString(16)}")
+                    continue
                 }
+
+                // Extract EXIF signature
+                val exif = extractExifSignaturePartial(objectImage)
+
+                val checksum = objectImage.image.bytes.take(100).hashCode()
+                val size = objectImage.objectInfo.objectCompressedSize
+
+                // ✅ Match iOS signature logic exactly
+                val fallbackKey = "${objectImage.objectInfo.filename}_$size"
+                val baseKey = if (!exif.isNullOrEmpty()) exif else fallbackKey
+                val signature = "${baseKey}_$checksum"
+
+                // Database check via app layer
+                val objectInfoWithExif = ObjectImageWithExif(objectImage.objectInfo, exif)
+                val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
+                    objectInfoWithExif,
+                    isSkipAutoUpload
+                ) ?: false
+
+                if (isExist) {
+                    session.log.d(TAG, "🚫 SKIP: already in DB")
+                    localExifDatabaseExist.add(signature)
+                    continue
+                }
+
+                if (localExifDatabaseExist.contains(signature)) {
+                    session.log.d(TAG, "🚫 SKIP: already in local cache")
+                    continue
+                }
+
+                // Insert to cache right before callback
+                localExifDatabaseExist.add(signature)
+
+                // Deliver to app
+                val enrichedImage = objectImage.copy(exifKey = exif)
+                listenerCamera?.onImageDownloaded(enrichedImage)
             } else {
-                delay(3000)
+                delay((3000))
+            }
+
+            if (isFirstLoop) {
+                session.log.d(TAG, "⚙️ First loop finished → disable skipAutoUpload")
+                isFirstLoop = false
+                isSkipAutoUpload = false
             }
         }
+
         listenerCamera?.onStop()
-    }
-
-    private fun fetchEvent(worker: WorkerExecutor): ByteBuffer? {
-        val eventIn = ByteBuffer.allocate(
-            max(worker.getConnection().maxPacketInSize, worker.getConnection().maxPacketOutSize)
-        )
-        eventIn.order(ByteOrder.LITTLE_ENDIAN)
-        val maxPacketSize = worker.getConnection().maxPacketInSize
-        eventIn.position(0)
-
-        val readSize = worker.getConnection().transferInEvent(eventIn.array(), maxPacketSize, 1000) // 0 its mean infinite
-        if (readSize < 12) {
-            return null
-        }
-
-        session.log.d(TAG, "event: " + PacketUtil.hexDumpToString(eventIn.duplicate().array(), 0, readSize))
-
-        val length = eventIn.int
-        val type = eventIn.short
-
-        return if (type == PtpConstants.Type.Event.toShort() && length == readSize) {
-            val sender = ByteBuffer.allocate(readSize)
-            eventIn.position(0)
-            eventIn.get(sender.array(), 0, readSize)
-            sender
-        } else {
-            null
-        }
-    }
-
-    private fun getHandlerObjectAdded(byteBuffer: ByteBuffer): Int? {
-        // 10 00 00 00 04 00 03 c2 ff ff ff ff 1d d2 00 00
-        byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
-        byteBuffer.position(0)
-        val length = byteBuffer.int
-        val type = byteBuffer.short
-        val code = byteBuffer.short
-        val tx = byteBuffer.int
-
-        return if (code == PtpConstants.Event.SonyObjectAdded.toShort()) {
-            byteBuffer.int
-        } else {
-            session.log.e(TAG, "getHandlerObjectAdded: length $length, type $type, code $code, tx $tx")
-            null
-        }
     }
 
     private fun checkInMemoryImage(propDesc: List<SonyDevicePropDesc>, deviceInfo: DeviceInfo): Boolean {
@@ -196,33 +159,25 @@ class SonyCamera(private val session: Session): BaseCamera() {
                 }
 
                 if (oldDesc != null && oldDesc.propCode == (0xd215).toShort()) {
-                    // > 0x8000 its value from gPhoto2 -32765
-                    // < 0 its my decide the value
                     val currentValue = desc.currentValue
                     if (deviceInfo.model == "ILCE-7M4") {
-                        // A7 IV special case cause its show sometime 1 and sometime - minus
                         if (currentValue != 0L) {
-                            session.log.d(TAG, "checkInMemoryImage current: ${desc.currentValue} and $currentValue")
                             isImagePending = true
                         }
                     } else if (minus0List.contains(deviceInfo.model)) {
                         if (currentValue < 0) {
-                            session.log.d(TAG, "checkInMemoryImage current: ${desc.currentValue} and $currentValue")
                             isImagePending = true
                         }
                     } else {
                         if (currentValue < 0) {
-                            session.log.d(TAG, "checkInMemoryImage current: ${desc.currentValue} and $currentValue")
                             isImagePending = true
                         }
                     }
-                    // ILCE-7SM3
                 }
             } else {
                 devicePropsDescMap[desc.propCode] = desc
             }
         }
-
         return isImagePending
     }
 
@@ -285,39 +240,47 @@ class SonyCamera(private val session: Session): BaseCamera() {
         return ObjectImage(objectInfo, handler, imageObject)
     }
 
-
-    private fun generateExifUniqueKeyFromBytes(objectImage: ObjectImage): String? {
+    private fun extractExifSignaturePartial(objectImage: ObjectImage): String? {
         return try {
-            val imageBytes = objectImage.image.bytes
-            if (imageBytes.size < 128) return null // Too small for valid EXIF
-
-            val exif = android.media.ExifInterface(java.io.ByteArrayInputStream(imageBytes))
-
-            fun clean(value: String?): String = value?.trim()?.takeIf { it.isNotBlank() } ?: ""
-
-            val make = clean(exif.getAttribute(android.media.ExifInterface.TAG_MAKE))
-            val model = clean(exif.getAttribute(android.media.ExifInterface.TAG_MODEL))
-            val dateTimeOriginal = clean(exif.getAttribute(android.media.ExifInterface.TAG_DATETIME_ORIGINAL))
-            val subSecDigitized = clean(exif.getAttribute(android.media.ExifInterface.TAG_SUBSEC_TIME_DIGITIZED))
-            val subSecOriginal = clean(exif.getAttribute(android.media.ExifInterface.TAG_SUBSEC_TIME_ORIGINAL))
-            val subSecTime = if (subSecDigitized.isNotEmpty()) subSecDigitized else subSecOriginal
-            val uniqueId = clean(
-                exif.getAttribute(android.media.ExifInterface.TAG_IMAGE_UNIQUE_ID)
-                    ?: exif.getAttribute("ImageUniqueID")
-            )
-
-            // Require at least model + dateTime for a valid key
-            if (model.isEmpty() || dateTimeOriginal.isEmpty()) return null
-
-            // Build unique signature
-            return "${make}_${model}_${dateTimeOriginal}_${subSecTime}_${uniqueId}"
-
+            generateExifUniqueKeyFromBytes(objectImage)
         } catch (e: Exception) {
-            session.log.w(TAG, "❌ EXIF parse failed | filename=${objectImage.objectInfo.filename} | error=${e.message}", e)
             null
         }
     }
 
+    private fun generateExifUniqueKeyFromBytes(objectImage: ObjectImage): String? {
+        return try {
+            val imageBytes = objectImage.image.bytes
+            if (imageBytes.size < 128) {
+                // session.log.d(TAG, "EXIF: file too small | ${objectImage.objectInfo.filename}")
+                return null
+            }
+
+            val exif = ExifInterface(ByteArrayInputStream(imageBytes))
+            fun clean(value: String?): String = value?.trim()?.takeIf { it.isNotBlank() } ?: ""
+
+            val make = clean(exif.getAttribute(ExifInterface.TAG_MAKE))
+            val model = clean(exif.getAttribute(ExifInterface.TAG_MODEL))
+            val dateTimeOriginal = clean(exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL))
+            val subSecDigitized = clean(exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_DIGITIZED))
+            val subSecOriginal = clean(exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_ORIGINAL))
+            val subSecTime = if (subSecDigitized.isNotEmpty()) subSecDigitized else subSecOriginal
+            val uniqueId = clean(
+                exif.getAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID)
+                    ?: exif.getAttribute("ImageUniqueID")
+            )
+
+            if (model.isEmpty() || dateTimeOriginal.isEmpty()) {
+                // if (BuildConfig.DEBUG) session.log.d(TAG, "EXIF: missing model/date | ${objectImage.objectInfo.filename}")
+                return null
+            }
+
+            "${make}_${model}_${dateTimeOriginal}_${subSecTime}_${uniqueId}"
+        } catch (e: Exception) {
+            // session.log.w(TAG, "EXIF: parse error | ${objectImage.objectInfo.filename} | ${e.message}")
+            null
+        }
+    }
     companion object {
         private const val TAG = "SonyCamera"
     }

@@ -157,15 +157,16 @@ class CanonCamera(
                     val getNumObjects = handlerCommandRetry(session, executor) {
                         GetNumObjectsCommand(session, storageId)
                     }
-                    val currentCount = getNumObjects.getResult().getOrDefault(0)
+                    val currentCount = getNumObjects.getResult().getOrDefault(-1)
                     val previousCount = objectCountByStorage[storageId] ?: 0
 
-                    // Only re-query handles if count increased (new images detected)
-                    if (currentCount != previousCount) {
-                        session.log.d(
-                            TAG,
-                            "Storage $storageId: new images detected ($previousCount → $currentCount)"
-                        )
+                    session.log.d(
+                        TAG,
+                        "Storage $storageId: [BEFORE] previousCount=$previousCount, currentCount=$currentCount " +
+                                "(currentCount == -1 ? ${currentCount == -1}, currentCount > previousCount ? ${currentCount > previousCount})"
+                    )
+
+                    if (currentCount != previousCount || currentCount == -1) {
                         objectCountByStorage[storageId] = currentCount
                         processStorageImages(executor, session, storageId, false)
                     }
