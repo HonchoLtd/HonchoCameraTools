@@ -23,6 +23,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import java.io.ByteArrayInputStream
 import java.nio.ByteOrder
+import java.util.Locale
 
 class SonyCamera(private val session: Session) : BaseCamera() {
     private var isPartialSupport = false
@@ -100,15 +101,24 @@ class SonyCamera(private val session: Session) : BaseCamera() {
                 // Extract EXIF signature
                 val exif = extractExifSignaturePartial(objectImage)
 
-                val checksum = objectImage.image.bytes.take(100).hashCode()
+                val checksum = objectImage.image.bytes.contentHashCode()
                 val size = objectImage.objectInfo.objectCompressedSize
 
-                // ✅ Match iOS signature logic exactly
                 val fallbackKey = "${objectImage.objectInfo.filename}_$size"
                 val baseKey = if (!exif.isNullOrEmpty()) exif else fallbackKey
                 val signature = "${baseKey}_$checksum"
 
-                // Database check via app layer
+                session.log.d(TAG, """
+                    📊 Signature Components
+                    - filename: ${objectImage.objectInfo.filename}
+                    - exifKey: ${exif?.take(60) ?: "NULL ⚠️"}
+                    - exifIsNull: ${exif.isNullOrEmpty()}
+                    - size: $size
+                    - checksum: $checksum
+                    - fallbackKey: ${objectImage.objectInfo.filename}_$size
+                    - finalSignature: $signature
+                """.trimIndent())
+
                 val objectInfoWithExif = ObjectImageWithExif(objectImage.objectInfo, exif)
                 val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
                     objectInfoWithExif,
@@ -242,7 +252,8 @@ class SonyCamera(private val session: Session) : BaseCamera() {
 
     private fun extractExifSignaturePartial(objectImage: ObjectImage): String? {
         return try {
-            generateExifUniqueKeyFromBytes(objectImage)
+            val exifKey = generateExifUniqueKeyFromBytes(objectImage)
+            return exifKey
         } catch (e: Exception) {
             null
         }
@@ -252,7 +263,7 @@ class SonyCamera(private val session: Session) : BaseCamera() {
         return try {
             val imageBytes = objectImage.image.bytes
             if (imageBytes.size < 128) {
-                // session.log.d(TAG, "EXIF: file too small | ${objectImage.objectInfo.filename}")
+                session.log.d(TAG, "⚠️ EXIF: file too small (${imageBytes.size}B) | ${objectImage.objectInfo.filename}")
                 return null
             }
 
@@ -270,17 +281,36 @@ class SonyCamera(private val session: Session) : BaseCamera() {
                     ?: exif.getAttribute("ImageUniqueID")
             )
 
+            // 🔍 Log extracted values for debugging
+            session.log.d(TAG, "🔍 EXIF Debug | filename=${objectImage.objectInfo.filename} | make=$make | model=$model | date=$dateTimeOriginal | subsec=$subSecTime | uniqueId=$uniqueId")
+
             if (model.isEmpty() || dateTimeOriginal.isEmpty()) {
-                // if (BuildConfig.DEBUG) session.log.d(TAG, "EXIF: missing model/date | ${objectImage.objectInfo.filename}")
+                session.log.w(TAG, "⚠️ EXIF: missing required fields | model=$model | date=$dateTimeOriginal | filename=${objectImage.objectInfo.filename}")
                 return null
             }
 
-            "${make}_${model}_${dateTimeOriginal}_${subSecTime}_${uniqueId}"
+            val actualSubSec = subSecTime.ifEmpty {
+                val millis = System.currentTimeMillis() % 1000
+                String.format(Locale.US, "%03d", millis)
+            }
+
+            val key = "${make}_${model}_${dateTimeOriginal}_${actualSubSec}_${uniqueId}"
+
+            session.log.d(TAG, """
+            ✅ EXIF Key Generated
+            - filename: ${objectImage.objectInfo.filename}
+            - real subsec: '${subSecTime}' ${if (subSecTime.isEmpty()) "(empty)" else "(kept as-is, ${subSecTime.length} digits)"}
+            - subsec used in key: '$actualSubSec' ${if (subSecTime.isEmpty()) "(fake from millis)" else "(real from EXIF)"}
+            - key: ${key.take(100)}...
+        """.trimIndent())
+            return key
+
         } catch (e: Exception) {
-            // session.log.w(TAG, "EXIF: parse error | ${objectImage.objectInfo.filename} | ${e.message}")
+            session.log.e(TAG, "❌ EXIF: exception | filename=${objectImage.objectInfo.filename} | error=${e.message}", e)
             null
         }
     }
+
     companion object {
         private const val TAG = "SonyCamera"
     }
