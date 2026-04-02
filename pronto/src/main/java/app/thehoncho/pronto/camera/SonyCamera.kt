@@ -108,17 +108,6 @@ class SonyCamera(private val session: Session) : BaseCamera() {
                 val baseKey = if (!exif.isNullOrEmpty()) exif else fallbackKey
                 val signature = "${baseKey}_$checksum"
 
-                session.log.d(TAG, """
-                    📊 Signature Components
-                    - filename: ${objectImage.objectInfo.filename}
-                    - exifKey: ${exif?.take(60) ?: "NULL ⚠️"}
-                    - exifIsNull: ${exif.isNullOrEmpty()}
-                    - size: $size
-                    - checksum: $checksum
-                    - fallbackKey: ${objectImage.objectInfo.filename}_$size
-                    - finalSignature: $signature
-                """.trimIndent())
-
                 val objectInfoWithExif = ObjectImageWithExif(objectImage.objectInfo, exif)
                 val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
                     objectInfoWithExif,
@@ -281,9 +270,6 @@ class SonyCamera(private val session: Session) : BaseCamera() {
                     ?: exif.getAttribute("ImageUniqueID")
             )
 
-            // 🔍 Log extracted values for debugging
-            session.log.d(TAG, "🔍 EXIF Debug | filename=${objectImage.objectInfo.filename} | make=$make | model=$model | date=$dateTimeOriginal | subsec=$subSecTime | uniqueId=$uniqueId")
-
             if (model.isEmpty() || dateTimeOriginal.isEmpty()) {
                 session.log.w(TAG, "⚠️ EXIF: missing required fields | model=$model | date=$dateTimeOriginal | filename=${objectImage.objectInfo.filename}")
                 return null
@@ -295,14 +281,6 @@ class SonyCamera(private val session: Session) : BaseCamera() {
             }
 
             val key = "${make}_${model}_${dateTimeOriginal}_${actualSubSec}_${uniqueId}"
-
-            session.log.d(TAG, """
-            ✅ EXIF Key Generated
-            - filename: ${objectImage.objectInfo.filename}
-            - real subsec: '${subSecTime}' ${if (subSecTime.isEmpty()) "(empty)" else "(kept as-is, ${subSecTime.length} digits)"}
-            - subsec used in key: '$actualSubSec' ${if (subSecTime.isEmpty()) "(fake from millis)" else "(real from EXIF)"}
-            - key: ${key.take(100)}...
-        """.trimIndent())
             return key
 
         } catch (e: Exception) {
