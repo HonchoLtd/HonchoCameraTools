@@ -90,4 +90,30 @@ class ObjectInfo(b: ByteBuffer, length: Int) {
         )
         return parts.joinToString(separator = ".").replace("\u0000", "")
     }
+
+    fun getAllDataKey(): String {
+        val parts = listOf(
+            handlerID.toString(),
+            storageId.toString(),
+            objectFormat.toString(),
+            protectionStatus.toString(),
+            objectCompressedSize.toString(),
+            thumbFormat.toString(),
+            thumbCompressedSize.toString(),
+            thumbPixWidth.toString(),
+            thumbPixHeight.toString(),
+            imagePixWidth.toString(),
+            imagePixHeight.toString(),
+            imageBitDepth.toString(),
+            parentObject.toString(),
+            associationType.toString(),
+            associationDesc.toString(),
+            sequenceNumber.toString(),
+            (filename ?: "").trim().uppercase(),
+            (captureDate ?: "").trim(),
+            (modificationDate ?: "").trim(),
+            keywords.toString()
+        )
+        return parts.joinToString(separator = ".").replace("\u0000", "")
+    }
 }

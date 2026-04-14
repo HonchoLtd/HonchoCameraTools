@@ -46,7 +46,7 @@ abstract class BaseCamera: MultipleCommand() {
         // Call when the camera to filter the handler, handler return from this function will use
         // to download the image
         // Pre-download filtering (Canon/Nikon only, inefficient)
-        @Deprecated("Canon and Nikon: use post-download onIsImageAlreadyInDatabase instead")
+
         suspend fun onHandlersFilter(handlers: List<ObjectInfo>): List<ObjectInfo>
         // Library passes raw data; app decides how to build unique key
         suspend fun onIsImageAlreadyInDatabase(

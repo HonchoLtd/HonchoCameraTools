@@ -28,7 +28,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
-import kotlin.math.min
 
 class CanonCamera(
     private val session: Session
@@ -127,48 +126,87 @@ class CanonCamera(
 
         val objectCountByStorage = mutableMapOf<Int, Int>()
         var finishLoadStorageImage = false
-        while (executor.isRunning()) {
-            // PHASE 1: Initial scan of all valid storages
-            if (!finishLoadStorageImage) {
-                for (storageId in validStorageIds) {
-                    processStorageImages(executor, session, storageId, true)
 
-                    // Initialize count tracking for this storage after initial scan
-                    val getNumObjects = handlerCommandRetry(session, executor) {
+
+
+        while (executor.isRunning()) {
+            // ========== PHASE 1: Initial scan with BATCH FILTERING ==========
+            if (!finishLoadStorageImage) {
+
+
+                val allObjectInfos = mutableListOf<ObjectInfo>()
+
+                var dedupChecked = 0
+                var dedupSkipped = 0
+
+                for (storageId in validStorageIds) {
+                    val getObjectHandles = handlerCommandRetry(session, executor) {
+                        GetObjectHandlesCommand(session, storageId, MtpConstants.FORMAT_EXIF_JPEG)
+                    }
+                    val handlersFromStorage = getObjectHandles.getResult().getOrNull() ?: IntArray(0)
+
+                    for (handlerId in handlersFromStorage) {
+                        dedupChecked++
+                        if (localRawDatabase.contains(handlerId)) {
+                            dedupSkipped++
+                            continue
+                        }
+
+                        val getObjectInfoCommand = handlerCommandRetry(session, executor) {
+                            GetObjectInfoCommand(session, handlerId)
+                        }
+                        val objectInfo = getObjectInfoCommand.getResult().getOrNull()
+                        if (objectInfo != null) {
+                            objectInfo.handlerID = handlerId
+                            objectInfo.storageId = storageId
+                            allObjectInfos.add(objectInfo)
+                        }
+                    }
+                }
+
+                // Batch filter callback (kept separate if you still want to track it)
+                val filterStart = System.currentTimeMillis()
+                val handlersToSkip = listenerCamera?.onHandlersFilter(allObjectInfos) ?: emptyList()
+
+                // Mark skipped handlers
+                val skipSet = handlersToSkip.map { it.handlerID }.toSet()
+                localRawDatabase.addAll(skipSet)
+
+                // Process each storage
+                for (storageId in validStorageIds) {
+                    val initialCountCmd = handlerCommandRetry(session, executor) {
                         GetNumObjectsCommand(session, storageId)
                     }
-                    objectCountByStorage[storageId] = getNumObjects.getResult().getOrDefault(0)
+                    val baselineCount = if (initialCountCmd.responseCode == PtpConstants.Response.Ok) {
+                        initialCountCmd.getResult().getOrDefault(0)
+                    } else { 0 }
+                    objectCountByStorage[storageId] = baselineCount
+
+                    processStorageImages(executor, session, storageId, skipAutoUpload = true)
                 }
+
+
                 finishLoadStorageImage = true
                 isSkipAutoUpload = false
+                continue
             }
 
-            // PHASE 2: Event polling using GetNumObjects (Canon EOS optimized)
+            // ========== PHASE 2: Event polling ==========
             val getEventCommand = EOSGetEventCommand(session)
             executor.handleCommand(getEventCommand)
-
-            // Canon EOS: GetEvent just signals if events are pending (returns Boolean)
             val hasEvents = getEventCommand.getResult().getOrNull() ?: false
-            if (hasEvents) {
-                session.log.d(TAG, "execute getCleanHandlers: flush before download image")
 
+            if (hasEvents) {
                 for (storageId in validStorageIds) {
-                    // Use GetNumObjects to efficiently detect new images per storage
                     val getNumObjects = handlerCommandRetry(session, executor) {
                         GetNumObjectsCommand(session, storageId)
                     }
                     val currentCount = getNumObjects.getResult().getOrDefault(-1)
                     val previousCount = objectCountByStorage[storageId] ?: 0
 
-                    session.log.d(
-                        TAG,
-                        "Storage $storageId: [BEFORE] previousCount=$previousCount, currentCount=$currentCount " +
-                                "(currentCount == -1 ? ${currentCount == -1}, currentCount > previousCount ? ${currentCount > previousCount})"
-                    )
-
                     if (currentCount != previousCount || currentCount == -1) {
                         objectCountByStorage[storageId] = currentCount
-                        processStorageImages(executor, session, storageId, false)
+                        processStorageImages(executor, session, storageId, skipAutoUpload = false)
                     }
                 }
             }
@@ -326,57 +364,39 @@ class CanonCamera(
         }
         val handlersFromStorage = getObjectHandles.getResult().getOrNull() ?: return false
 
-        // 🧹 Filter handlers through deduplication layers
-        val handlerCleanFromRaw = handlersFromStorage.filter {
-            val skipped = localRawDatabase.contains(it)
-            if (skipped) internalSession.log.d(
-                TAG,
-                "⏭️ Filter: Skipping handler $it - in localRawDatabase"
-            )
-            !skipped
-        }
+        // Filter stages
+        val handlerCleanFromRaw = handlersFromStorage.filter { !localRawDatabase.contains(it) }
 
-        val handlerCleanExifExist = handlerCleanFromRaw.filter {
-            val skipped = localExifDatabaseExist.contains(it.toString())
-            if (skipped) internalSession.log.d(
-                TAG,
-                "⏭️ Filter: Skipping handler $it - EXIF key in localExifDatabaseExist"
-            )
-            !skipped
-        }
+        var processed = 0
+        var skippedByFormat = 0
+        var skippedByDedup = 0
 
-        val handlerFinalClean = handlerCleanExifExist.filter {
-            val skipped = localExifDatabaseNotFound.contains(it.toString())
-            if (skipped) internalSession.log.d(
-                TAG,
-                "⏭️ Filter: Skipping handler $it - handler ID in localExifDatabaseNotFound"
-            )
-            !skipped
-        }
+        for (handlerId in handlerCleanFromRaw) {
 
+            if (localRawDatabase.contains(handlerId)) continue
 
-        for (handlerId in handlerFinalClean) {
             val getObjectInfoCommand = handlerCommandRetry(internalSession, executor) {
                 GetObjectInfoCommand(internalSession, handlerId)
             }
             val objectInfo = getObjectInfoCommand.getResult().getOrNull() ?: continue
-
             val filename = objectInfo.filename?.uppercase() ?: ""
 
-            // Only process JPEG/JPG with EXIF_JPEG format
             if ((filename.endsWith(".JPEG") || filename.endsWith(".JPG")) &&
-                objectInfo.objectFormat == MtpConstants.FORMAT_EXIF_JPEG
-            ) {
+                objectInfo.objectFormat == MtpConstants.FORMAT_EXIF_JPEG) {
+                if(localExifDatabaseNotFound.contains(objectInfo.getAllDataKey())) {
+                    continue
+                }
+
                 val objectImage = onDownloadImage(executor, handlerId) ?: continue
 
-                // ✅ Extract EXIF from the downloaded image
                 val exifData = extractExifSignaturePartial(objectImage)
 
-                // ✅ Enrich ObjectImage with the extracted exifKey
                 val enrichedImage = objectImage.copy(exifKey = exifData)
-
-                // ✅ Use original objectInfo for dedup check (library interface)
                 val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifData)
+
+                if(localExifDatabaseExist.contains(objectInfoWithExif.exifKey)) {
+                    continue
+                }
 
                 val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
                     objectInfoWithExif,
@@ -384,22 +404,25 @@ class CanonCamera(
                 ) ?: false
 
                 if (isExist) {
-                    // 🗂️ Update dedup caches
+                    skippedByDedup++
                     if (exifData.isNullOrEmpty()) {
                         localExifDatabaseNotFound.add(handlerId.toString())
                     } else {
                         localExifDatabaseExist.add(exifData)
                     }
                 } else {
+                    processed++
                     consumeImage(enrichedImage)
                 }
             } else {
-                // 🚫 Mark non-JPEG/unsupported formats to skip in future scans
+                skippedByFormat++
                 localRawDatabase.add(handlerId)
             }
         }
+
         return true
     }
+
 
     private suspend fun extractExifSignaturePartial(objectImage: ObjectImage): String? {
         return try {
@@ -475,28 +498,17 @@ class CanonCamera(
         val exifData = objectImage.exifKey
 
         if (exifData.isNullOrEmpty()) {
-            if (!localExifDatabaseNotFound.contains(objectImage.handlerId.toString())) {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "📥 consumeImage: No EXIF - Adding handler to skip set | filename=$filename | handler=${objectImage.handlerId}"
-                )
-                localExifDatabaseNotFound.add(objectImage.handlerId.toString())
+            if (!localExifDatabaseNotFound.contains(objectImage.objectInfo.getAllDataKey())) {
+                localExifDatabaseNotFound.add(objectImage.objectInfo.getAllDataKey())
                 listenerCamera?.onImageDownloaded(objectImage)
             } else {
-                session.log.d(
-                    "DEBUG_DEDUP_LIB",
-                    "⏭️ consumeImage: Handler already in skip set - skipping callback | filename=$filename | handler=${objectImage.handlerId}"
-                )
             }
         } else {
             if (!localExifDatabaseExist.contains(exifData)) {
                 localExifDatabaseExist.add(exifData)
+                localRawDatabase.add(objectImage.handlerId)
                 listenerCamera?.onImageDownloaded(objectImage)
             } else {
-                session.log.d(
-                    TAG,
-                    "⏭️ consumeImage: EXIF key already in skip set - skipping callback | filename=$filename | exifKey=${exifData.take(40)}..."
-                )
             }
         }
     }
