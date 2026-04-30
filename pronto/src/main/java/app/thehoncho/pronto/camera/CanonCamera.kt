@@ -165,7 +165,6 @@ class CanonCamera(
                 }
 
                 // Batch filter callback (kept separate if you still want to track it)
-                val filterStart = System.currentTimeMillis()
                 val handlersToSkip = listenerCamera?.onHandlersFilter(allObjectInfos) ?: emptyList()
 
                 // Mark skipped handlers
