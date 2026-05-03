@@ -183,6 +183,11 @@ object PtpConstants {
         const val EosSetDevicePropValue = 0x9110
         const val EosSetPCConnectMode =
             0x9114 // Set Remote mode to make sure the Camera Connect as PTP not MTP
+
+        const val GetDirObjectInfoList= 0x917A      // R1: Get directory object list
+        const val GetPartialObject64= 0x9172        // R1: 64-bit offset partial download
+        const val GetPartialObjectEX64= 0x9174      // R1: Extended 64-bit partial with property code
+
         const val EosSetEventMode = 0x9115
         const val EosEventCheck = 0x9116
         const val EosTransferComplete = 0x9117

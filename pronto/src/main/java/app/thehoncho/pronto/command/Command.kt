@@ -117,6 +117,35 @@ abstract class Command(protected val session: Session): PTPAction {
         byteBuffer.putInt(p2)
     }
 
+    protected open fun encodeCommand(
+        byteBuffer: ByteBuffer, code: Short, p0: Int, p1: Int, p2: Int, p3: Int
+    ) {
+        byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
+        byteBuffer.putInt(28)
+        byteBuffer.putShort(PtpConstants.Type.Command)
+        byteBuffer.putShort(code)
+        byteBuffer.putInt(session.nextId)
+        byteBuffer.putInt(p0)
+        byteBuffer.putInt(p1)
+        byteBuffer.putInt(p2)
+        byteBuffer.putInt(p3)
+    }
+
+    protected open fun encodeCommand(
+        byteBuffer: ByteBuffer, code: Short, p0: Int, p1: Int, p2: Int, p3: Int, p4: Int
+    ) {
+        byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
+        byteBuffer.putInt(32)
+        byteBuffer.putShort(PtpConstants.Type.Command)
+        byteBuffer.putShort(code)
+        byteBuffer.putInt(session.nextId)
+        byteBuffer.putInt(p0)
+        byteBuffer.putInt(p1)
+        byteBuffer.putInt(p2)
+        byteBuffer.putInt(p3)
+        byteBuffer.putInt(p4)
+    }
+
     public fun isRetry(): Boolean {
         return responseCode == PtpConstants.Response.DeviceBusy || responseCode == PtpConstants.Response.StoreNotAvailable
     }
