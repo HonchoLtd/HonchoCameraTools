@@ -21,28 +21,25 @@ class GetDirObjectInfoListCommand(
         try {
             byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
 
-            // OpCode 0x917A, params: [storageId, parentHandle, formatFilter]
-            // Uses existing 3-param overload: code + p0, p1, p2
             encodeCommand(
                 byteBuffer,
                 PtpConstants.Operation.GetDirObjectInfoList.toShort(),
                 storageId,          // p0: Storage ID
-                parentHandle,       // p1: Parent/Folder Handle (0 = root)
+                parentHandle,       // p1: Parent/Folder Handle
                 formatFilter        // p2: Format/Property filter
             )
         } catch (e: Throwable) {
             this.throwable = e
-            session.log.e(TAG, "CanonCamera encodeCommand failed: ${e.message}", e)
+            session.log.e(TAG, "encodeCommand failed: ${e.message}", e)
         }
     }
 
     override fun decodeData(b: ByteBuffer, length: Int) {
-        session.log.d(TAG, "📥 CanonCamera GetDirObjectInfoList Response Code: $responseCode | Data Length: $length")
         try {
-            // ✅ PASS session to parseList
-            objectList = ObjectInfoR1.parseList(b, length, session)
+            objectList = ObjectInfoR1.parseList(b, length)
+            session.log.d(TAG, "GetDirObjectInfoList: Parsed ${objectList.size} objects")
         } catch (e: Exception) {
-            session.log.e(TAG, "CanonCamera Failed to decode GetDirObjectInfoList data", e)
+            session.log.e(TAG, "Failed to decode GetDirObjectInfoList data", e)
             this.throwable = e
         }
     }
@@ -50,20 +47,20 @@ class GetDirObjectInfoListCommand(
     override fun decodeResponse(b: ByteBuffer, length: Int) {
         when (responseCode) {
             PtpConstants.Response.Ok -> {
-                session.log.d(TAG, "CanonCamera GetDirObjectInfoList: OK, ${objectList.size} items")
+                session.log.d(TAG, "GetDirObjectInfoList: OK, ${objectList.size} items")
             }
             PtpConstants.Response.GeneralError -> {
-                session.log.e(TAG, "CanonCamera GetDirObjectInfoList: General Error")
+                session.log.e(TAG, "GetDirObjectInfoList: General Error")
                 throwable = Throwable("GetDirObjectInfoList failed: General Error")
             }
             PtpConstants.Response.InvalidStorageID -> {
-                session.log.e(TAG, "CanonCamera GetDirObjectInfoList: Invalid Storage ID $storageId")
+                session.log.e(TAG, "GetDirObjectInfoList: Invalid Storage ID $storageId")
                 throwable = Throwable("Invalid storage ID: $storageId")
             }
             else -> {
-                session.log.w(TAG, "CanonCamera GetDirObjectInfoList: Response ${PtpConstants.responseToString(responseCode.toInt())}")
+                session.log.w(TAG, "GetDirObjectInfoList: Response ${PtpConstants.responseToString(responseCode.toInt())}")
                 if (responseCode != PtpConstants.Response.Ok) {
-                    throwable = Throwable("CanonCamera GetDirObjectInfoList failed: ${PtpConstants.responseToString(responseCode.toInt())}")
+                    throwable = Throwable("GetDirObjectInfoList failed: ${PtpConstants.responseToString(responseCode.toInt())}")
                 }
             }
         }
