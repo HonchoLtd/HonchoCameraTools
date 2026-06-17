@@ -4,7 +4,8 @@ import app.thehoncho.pronto.utils.PacketUtil
 import app.thehoncho.pronto.utils.PtpConstants
 import java.nio.ByteBuffer
 
-class ObjectInfo(b: ByteBuffer, length: Int) {
+
+class ObjectInfo {
     var handlerID = 0
     var storageId = 0
     var objectFormat = 0
@@ -26,7 +27,10 @@ class ObjectInfo(b: ByteBuffer, length: Int) {
     var modificationDate: String? = null
     var keywords = 0
 
-    init {
+    // ✅ NEW: Empty constructor for manual population (e.g., from ObjectInfoR1)
+    constructor()
+
+    constructor(b: ByteBuffer, length: Int) {
         decode(b, length)
     }
 
@@ -49,19 +53,17 @@ class ObjectInfo(b: ByteBuffer, length: Int) {
         filename = PacketUtil.readString(b)
         captureDate = PacketUtil.readString(b)
         modificationDate = PacketUtil.readString(b)
-        keywords = b.get().toInt() // string, not used on camera?
+        keywords = b.get().toInt()
     }
 
     override fun toString(): String {
         val b = StringBuilder()
         b.append("ObjectInfo\n")
         b.append("StorageId: ").append(String.format("0x%08x\n", storageId))
-        b.append("ObjectFormat: ").append(PtpConstants.objectFormatToString(objectFormat))
-            .append('\n')
+        b.append("ObjectFormat: ").append(PtpConstants.objectFormatToString(objectFormat)).append('\n')
         b.append("ProtectionStatus: ").append(protectionStatus).append('\n')
         b.append("ObjectCompressedSize: ").append(objectCompressedSize).append('\n')
-        b.append("ThumbFormat: ").append(PtpConstants.objectFormatToString(thumbFormat))
-            .append('\n')
+        b.append("ThumbFormat: ").append(PtpConstants.objectFormatToString(thumbFormat)).append('\n')
         b.append("ThumbCompressedSize: ").append(thumbCompressedSize).append('\n')
         b.append("ThumbPixWith: ").append(thumbPixWidth).append('\n')
         b.append("ThumbPixHeight: ").append(thumbPixHeight).append('\n')
@@ -80,38 +82,23 @@ class ObjectInfo(b: ByteBuffer, length: Int) {
 
     fun getID(): String {
         val parts = listOf(
-            handlerID.toString(),
-            storageId.toString(),
-            objectFormat.toString(),
-            parentObject.toString(),
-            captureDate ?: "",
-            modificationDate ?: "",
-            filename ?: ""
+            handlerID.toString(), storageId.toString(), objectFormat.toString(),
+            parentObject.toString(), captureDate ?: "", modificationDate ?: "", filename ?: ""
         )
         return parts.joinToString(separator = ".").replace("\u0000", "")
     }
 
     fun getAllDataKey(): String {
         val parts = listOf(
-            handlerID.toString(),
-            storageId.toString(),
-            objectFormat.toString(),
-            protectionStatus.toString(),
-            objectCompressedSize.toString(),
-            thumbFormat.toString(),
-            thumbCompressedSize.toString(),
-            thumbPixWidth.toString(),
-            thumbPixHeight.toString(),
-            imagePixWidth.toString(),
-            imagePixHeight.toString(),
-            imageBitDepth.toString(),
-            parentObject.toString(),
-            associationType.toString(),
-            associationDesc.toString(),
-            sequenceNumber.toString(),
-            (filename ?: "").trim().uppercase(),
-            (captureDate ?: "").trim(),
-            (modificationDate ?: "").trim(),
+            handlerID.toString(), storageId.toString(), objectFormat.toString(),
+            protectionStatus.toString(), objectCompressedSize.toString(),
+            thumbFormat.toString(), thumbCompressedSize.toString(),
+            thumbPixWidth.toString(), thumbPixHeight.toString(),
+            imagePixWidth.toString(), imagePixHeight.toString(),
+            imageBitDepth.toString(), parentObject.toString(),
+            associationType.toString(), associationDesc.toString(),
+            sequenceNumber.toString(), (filename ?: "").trim().uppercase(),
+            (captureDate ?: "").trim(), (modificationDate ?: "").trim(),
             keywords.toString()
         )
         return parts.joinToString(separator = ".").replace("\u0000", "")

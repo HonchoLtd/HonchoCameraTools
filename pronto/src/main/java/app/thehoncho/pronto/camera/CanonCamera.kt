@@ -26,6 +26,7 @@ import app.thehoncho.pronto.model.ImageObject
 import app.thehoncho.pronto.model.ObjectImage
 import app.thehoncho.pronto.model.ObjectImageWithExif
 import app.thehoncho.pronto.model.ObjectInfo
+import app.thehoncho.pronto.model.ObjectInfoR1
 import app.thehoncho.pronto.utils.PtpConstants
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -33,170 +34,180 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
-class CanonCamera(
-    private val session: Session
-): BaseCamera() {
+class CanonCamera(private val session: Session) : BaseCamera() {
 
-    // ========== R1 Support: Camera Model Detection ==========
     private sealed class CameraModel {
-        object Normal : CameraModel()      // Supports GetPartialObject (32-bit)
-        object R1 : CameraModel()          // Canon EOS R1: needs 64-bit + DirList
-        object Legacy : CameraModel()      // No partial support: full download only
+        object Normal : CameraModel()
+        object R1 : CameraModel()
+        object Legacy : CameraModel()
     }
 
     private var cameraModel: CameraModel = CameraModel.Legacy
     private var isR1Camera: Boolean = false
     private var isExtendedEventEnabled: Boolean = false
 
-    // In-memory deduplication sets (unchanged)
     private val localRawDatabase = mutableSetOf<Int>()
     private val localExifDatabaseExist = mutableSetOf<String>()
     private val localExifDatabaseNotFound = mutableSetOf<String>()
     private var isSkipAutoUpload = true
 
     override fun execute(executor: WorkerExecutor) = runBlocking {
+        session.log.d(TAG, "🚀 [EXECUTE] CanonCamera Starting camera execution...")
         val deviceInfo = onConnecting(executor)
         if (deviceInfo == null) {
-            session.log.e(TAG, "execute: failed when connecting")
-            listenerCamera?.onDeviceFailedToConnect(Throwable("failed when get device info, please check the cable or port"))
+            session.log.e(TAG, "❌ [EXECUTE] CanonCamera Failed to connect!")
+            listenerCamera?.onDeviceFailedToConnect(Throwable("failed when get device info"))
             listenerCamera?.onStop()
             return@runBlocking
         }
         listenerCamera?.onDeviceConnected(deviceInfo)
 
-        // ========== R1: Detect Camera Model ==========
         detectCameraModel(deviceInfo)
 
-        // Enable extended events for R1
         if (isR1Camera) {
+            session.log.d(TAG, "📡 [R1] CanonCamera Attempting to enable Extended Events...")
             val setExtendedEventCmd = SetExtendedEventInfoCommand(session, mode = 1)
             executor.handleCommand(setExtendedEventCmd)
             setExtendedEventCmd.getResult().onSuccess {
                 isExtendedEventEnabled = true
-                session.log.d(TAG, "Extended events enabled for R1")
+                session.log.d(TAG, "✅ [R1] CanonCamera Extended events enabled successfully!")
             }.onFailure {
-                session.log.w(TAG, "Failed to enable extended events for R1")
+                session.log.w(TAG, "⚠️ [R1] CanonCamera Failed to enable extended events. Will use standard polling.")
             }
         }
 
         val getStorageIds = GetStorageIdsCommand(session)
         executor.handleCommand(getStorageIds)
-        getStorageIds.getResult().onFailure {
-            session.log.e(TAG, "execute: failed when get storage ids")
-            listenerCamera?.onError(Throwable("failed when get storage ids, please check the sd card"))
-            listenerCamera?.onStop()
-            return@runBlocking
-        }
         val storageIds = getStorageIds.getResult().getOrNull() ?: IntArray(0)
+        session.log.d(TAG, "💾 [STORAGE] CanonCamera Found ${storageIds.size} storage IDs: ${storageIds.joinToString()}")
 
         if (storageIds.isEmpty()) {
-            session.log.e(TAG, "execute: storageIds is empty")
-            listenerCamera?.onError(Throwable("storage ids is empty, please check the sd card"))
+            listenerCamera?.onError(Throwable("storage ids is empty"))
             listenerCamera?.onStop()
             return@runBlocking
         }
 
         listenerCamera?.onReady()
 
-        // Validate storages
         val validStorageIds = mutableListOf<Int>()
         storageIds.forEach { storage ->
             val getStorageInfoCmd = GetStorageInfoCommand(session, storage)
             executor.handleCommand(getStorageInfoCmd)
-            when (getStorageInfoCmd.responseCode) {
-                PtpConstants.Response.Ok -> {
-                    getStorageInfoCmd.getResult().getOrNull()?.let { info ->
-                        if (info.maxCapacity > 0) {
-                            validStorageIds.add(storage)
-                        }
-                    }
-                }
-                PtpConstants.Response.StoreNotAvailable -> {
-                    session.log.w(TAG, "Storage Not Available id: $storage")
-                }
-                else -> {
-                    listenerCamera?.onError(Throwable("Cannot populate storage"))
-                    listenerCamera?.onStop()
-                    return@runBlocking
+            if (getStorageInfoCmd.responseCode == PtpConstants.Response.Ok) {
+                getStorageInfoCmd.getResult().getOrNull()?.let { info ->
+                    if (info.maxCapacity > 0) validStorageIds.add(storage)
                 }
             }
         }
+        session.log.d(TAG, "💾 [STORAGE] CanonCamera Valid storages: ${validStorageIds.size}")
 
         val objectCountByStorage = mutableMapOf<Int, Int>()
         var finishLoadStorageImage = false
 
         while (executor.isRunning()) {
-            // ========== PHASE 1: Initial scan ==========
             if (!finishLoadStorageImage) {
+                session.log.d(TAG, "🔄 [PHASE 1] CanonCamera Starting initial scan...")
                 val allObjectInfos = mutableListOf<ObjectInfo>()
 
                 for (storageId in validStorageIds) {
-                    // ✅ R1: Use DirObjectInfoList for faster batch listing
-                    val handlersFromStorage = if (isR1Camera && isExtendedEventEnabled) {
+                    if (isR1Camera && isExtendedEventEnabled) {
+                        session.log.d(TAG, "📡 [R1] CanonCamera Trying GetDirObjectInfoListCommand for storage $storageId...")
                         val dirListCmd = GetDirObjectInfoListCommand(session, storageId)
                         executor.handleCommand(dirListCmd)
-                        dirListCmd.getResult().getOrNull()?.map { it.handlerID }?.toIntArray() ?: intArrayOf()
+
+                        val dirResult = dirListCmd.getResult()
+                        val dirList = dirResult.getOrNull()
+
+                        if (dirResult.isSuccess && !dirList.isNullOrEmpty()) {
+                            session.log.d(TAG, "✅ [R1] CanonCamera GetDirObjectInfoList SUCCESS! Found ${dirList.size} objects.")
+                            for (objR1 in dirList) {
+                                if (localRawDatabase.contains(objR1.handlerID)) continue
+                                // ✅ Clean conversion without dummy buffer!
+                                val objectInfo = objR1.toObjectInfo()
+                                allObjectInfos.add(objectInfo)
+                            }
+                        } else {
+                            session.log.w(TAG, "❌ [R1] CanonCamera GetDirObjectInfoList FAILED. Falling back to GetObjectHandlesCommand!")
+                            val getObjectHandles = handlerCommandRetry(session, executor) { GetObjectHandlesCommand(session, storageId, 0) }
+                            val handlersFromStorage = getObjectHandles.getResult().getOrNull() ?: intArrayOf()
+                            for (handlerId in handlersFromStorage) {
+                                if (localRawDatabase.contains(handlerId)) continue
+                                val getObjectInfoCommand = handlerCommandRetry(session, executor) { GetObjectInfoCommand(session, handlerId) }
+                                val objectInfo = getObjectInfoCommand.getResult().getOrNull()
+                                if (objectInfo != null) {
+                                    objectInfo.handlerID = handlerId
+                                    objectInfo.storageId = storageId
+                                    allObjectInfos.add(objectInfo)
+                                }
+                            }
+                        }
                     } else {
-                        val getObjectHandles = handlerCommandRetry(session, executor) {
-                            GetObjectHandlesCommand(session, storageId, MtpConstants.FORMAT_EXIF_JPEG)
-                        }
-                        getObjectHandles.getResult().getOrNull() ?: intArrayOf()
-                    }
-
-                    for (handlerId in handlersFromStorage) {
-                        if (localRawDatabase.contains(handlerId)) continue
-
-                        val getObjectInfoCommand = handlerCommandRetry(session, executor) {
-                            GetObjectInfoCommand(session, handlerId)
-                        }
-                        val objectInfo = getObjectInfoCommand.getResult().getOrNull()
-                        if (objectInfo != null) {
-                            objectInfo.handlerID = handlerId
-                            objectInfo.storageId = storageId
-                            allObjectInfos.add(objectInfo)
+                        session.log.d(TAG, "📡 [Normal] CanonCamera Using GetObjectHandlesCommand for storage $storageId...")
+                        val getObjectHandles = handlerCommandRetry(session, executor) { GetObjectHandlesCommand(session, storageId, MtpConstants.FORMAT_EXIF_JPEG) }
+                        val handlersFromStorage = getObjectHandles.getResult().getOrNull() ?: intArrayOf()
+                        for (handlerId in handlersFromStorage) {
+                            if (localRawDatabase.contains(handlerId)) continue
+                            val getObjectInfoCommand = handlerCommandRetry(session, executor) { GetObjectInfoCommand(session, handlerId) }
+                            val objectInfo = getObjectInfoCommand.getResult().getOrNull()
+                            if (objectInfo != null) {
+                                objectInfo.handlerID = handlerId
+                                objectInfo.storageId = storageId
+                                allObjectInfos.add(objectInfo)
+                            }
                         }
                     }
                 }
 
-                // Batch filter callback
                 val handlersToSkip = listenerCamera?.onHandlersFilter(allObjectInfos) ?: emptyList()
                 localRawDatabase.addAll(handlersToSkip.map { it.handlerID })
+                session.log.d(TAG, "🔄 [PHASE 1] CanonCamera Skipped ${handlersToSkip.size} already uploaded images.")
 
-                // Process each storage
                 for (storageId in validStorageIds) {
-                    val initialCountCmd = handlerCommandRetry(session, executor) {
-                        GetNumObjectsCommand(session, storageId)
-                    }
-                    val baselineCount = if (initialCountCmd.responseCode == PtpConstants.Response.Ok) {
-                        initialCountCmd.getResult().getOrDefault(0)
-                    } else { 0 }
+                    val initialCountCmd = handlerCommandRetry(session, executor) { GetNumObjectsCommand(session, storageId) }
+                    val baselineCount = if (initialCountCmd.responseCode == PtpConstants.Response.Ok) initialCountCmd.getResult().getOrDefault(0) else 0
                     objectCountByStorage[storageId] = baselineCount
-
-                    // ✅ R1: Pass isR1Camera flag to processStorageImages
                     processStorageImages(executor, session, storageId, skipAutoUpload = true, isR1Camera = isR1Camera)
                 }
 
                 finishLoadStorageImage = true
                 isSkipAutoUpload = false
+                session.log.d(TAG, "✅ [PHASE 1] CanonCamera Initial scan finished! Moving to Phase 2 (Event Polling).")
                 continue
             }
 
-            // ========== PHASE 2: Event polling ==========
+            session.log.v(TAG, "🔄 [PHASE 2] CanonCamera Polling for events...")
             val getEventCommand = EOSGetEventCommand(session)
             executor.handleCommand(getEventCommand)
-            val hasEvents = getEventCommand.getResult().getOrNull() ?: false
+
+            val responseCode = getEventCommand.responseCode
+            val result = getEventCommand.getResult()
+            val hasEvents = result.getOrNull() ?: false
+
+            session.log.d(TAG, "📡 [EVENT] CanonCamera EOSGetEvent -> Code: $responseCode | hasEvents: $hasEvents | Success: ${result.isSuccess}")
+
+            if (result.isFailure || !hasEvents) delay(100L)
 
             if (hasEvents) {
+                session.log.d(TAG, "📸 [EVENT] CanonCamera Camera reported new events! Checking storages...")
                 for (storageId in validStorageIds) {
-                    val getNumObjects = handlerCommandRetry(session, executor) {
-                        GetNumObjectsCommand(session, storageId)
-                    }
-                    val currentCount = getNumObjects.getResult().getOrDefault(-1)
-                    val previousCount = objectCountByStorage[storageId] ?: 0
-
-                    if (currentCount != previousCount || currentCount == -1) {
-                        objectCountByStorage[storageId] = currentCount
-                        processStorageImages(executor, session, storageId, skipAutoUpload = false, isR1Camera = isR1Camera)
+                    if (isR1Camera) {
+                        session.log.d(TAG, "📸 [EVENT] CanonCamera R1 detected. Bypassing GetNumObjects and scanning DirList directly...")
+                        processStorageImages(executor, session, storageId, skipAutoUpload = false, isR1Camera = true)
+                    } else {
+                        val getNumObjects = handlerCommandRetry(session, executor) { GetNumObjectsCommand(session, storageId) }
+                        val numResult = getNumObjects.getResult()
+                        if (numResult.isSuccess) {
+                            val currentCount = numResult.getOrDefault(0)
+                            val previousCount = objectCountByStorage[storageId] ?: 0
+                            if (currentCount != previousCount) {
+                                session.log.d(TAG, "📸 [EVENT] CanonCamera Count changed! Previous: $previousCount -> Current: $currentCount. Processing...")
+                                objectCountByStorage[storageId] = currentCount
+                                processStorageImages(executor, session, storageId, skipAutoUpload = false, isR1Camera = false)
+                            }
+                        } else {
+                            session.log.e(TAG, "❌ [EVENT] CanonCamera GetNumObjects FAILED (Code: ${getNumObjects.responseCode})! Waiting 1s...")
+                            delay(1000L)
+                        }
                     }
                 }
             }
@@ -204,380 +215,392 @@ class CanonCamera(
         listenerCamera?.onStop()
     }
 
-    // ========== R1: Camera Model Detection ==========
     private fun detectCameraModel(deviceInfo: DeviceInfo) {
-        // Check for R1 model first
-        if (deviceInfo.model?.equals("R1", ignoreCase = true) == true) {
+        val modelName = deviceInfo.model?.trim() ?: ""
+        session.log.d(TAG, "🕵️ [DETECT] CanonCamera Model string: '$modelName' | Operations: ${deviceInfo.operationsSupported?.size ?: 0}")
+
+        if (modelName.equals("Canon EOS R1", ignoreCase = true) ||
+            modelName.equals("R1", ignoreCase = true) ||
+            modelName.contains("EOS R1", ignoreCase = true)) {
             cameraModel = CameraModel.R1
             isR1Camera = true
-            session.log.d(TAG, "Detected Canon EOS R1")
+            session.log.d(TAG, "✅ [DETECT] CanonCamera Detected Canon EOS R1 (Using DirList + Extended Events)")
             return
         }
 
-        // Check for partial object support (32-bit)
-        deviceInfo.operationsSupported.forEach { opt ->
+        var has64Bit = false
+        var has32Bit = false
+        deviceInfo.operationsSupported?.forEach { opt ->
             when (opt.toShort()) {
-                PtpConstants.Operation.GetPartialObject64.toShort() -> {
-                    // R1 or other cameras with 64-bit support
-                    cameraModel = CameraModel.R1
-                    isR1Camera = true
-                    return@forEach
-                }
-                PtpConstants.Operation.GetPartialObject -> {
-                    cameraModel = CameraModel.Normal
-                    return@forEach
-                }
+                PtpConstants.Operation.GetPartialObject64.toShort() -> has64Bit = true
+                PtpConstants.Operation.GetPartialObject.toShort() -> has32Bit = true
             }
         }
 
-        // Default to legacy if no partial support found
-        if (cameraModel is CameraModel.Legacy) {
-            session.log.w(TAG, "Camera does not support partial object download, using full download")
+        if (has64Bit) {
+            cameraModel = CameraModel.Normal
+            isR1Camera = false
+            session.log.d(TAG, "✅ [DETECT] CanonCamera Non-R1 with 64-bit support (Using standard handles)")
+        } else if (has32Bit) {
+            cameraModel = CameraModel.Normal
+            isR1Camera = false
+            session.log.d(TAG, "✅ [DETECT] CanonCamera Camera with 32-bit support")
+        } else {
+            cameraModel = CameraModel.Legacy
+            isR1Camera = false
+            session.log.w(TAG, "⚠️ [DETECT] CanonCamera No partial support, using full download")
         }
     }
 
     private fun onConnecting(worker: WorkerExecutor): DeviceInfo? {
-        // Existing connection logic (unchanged)
         val closeSessionCommand = CloseSessionCommand(session)
         worker.handleCommand(closeSessionCommand)
-
         val openSessionCommand = OpenSessionCommand(session)
         worker.handleCommand(openSessionCommand)
-
         val getDeviceInfoCommand = GetDeviceInfoCommand(session)
         worker.handleCommand(getDeviceInfoCommand)
-
         val eosRequestPCModeCommand = EOSRequestPCModeCommand(session)
         worker.handleCommand(eosRequestPCModeCommand)
-
         getDeviceInfoCommand.getResult().onFailure {
-            session.log.e(TAG, "onConnecting: failed when get device info")
+            session.log.e(TAG, "CanonCamera onConnecting: failed when get device info")
         }
-
         return getDeviceInfoCommand.getResult().getOrNull()
     }
 
-    // ========== R1: Download Routing ==========
+    // ✅ R1-SPECIFIC DOWNLOAD FUNCTIONS
+    private suspend fun onDownloadImageR1(worker: WorkerExecutor, objR1: ObjectInfoR1): ObjectImage? {
+        session.log.d(TAG, "CanonCamera 🔍 [R1 DOWNLOAD] Starting download for handler 0x${objR1.handlerID.toString(16)} | File: ${objR1.filename} | Size: ${objR1.objectSize64}")
+        return downloadImagePartial64R1(worker, objR1)
+    }
+
+    private suspend fun downloadImagePartial64R1(worker: WorkerExecutor, objR1: ObjectInfoR1): ObjectImage? {
+        var offset: Long = 0L
+        val totalBytes = objR1.objectSize64
+        session.log.d(TAG, "CanonCamera 🔍 [R1 DOWNLOAD] Initializing chunk loop | Total Bytes: $totalBytes | Max Chunk: 2MB")
+
+        if (totalBytes <= 0) {
+            session.log.e(TAG, "CanonCamera ❌ [R1 DOWNLOAD] Total bytes is 0 or negative! Aborting.")
+            return null
+        }
+
+        val imageBuffer = ByteArrayOutputStream()
+        val maxChunkSize = 2 * 1024 * 1024L
+        var chunkIndex = 0
+
+        while (offset < totalBytes && worker.isRunning()) {
+            chunkIndex++
+            val remaining = totalBytes - offset
+            val chunkSize = remaining.coerceAtMost(maxChunkSize).toInt()
+            session.log.d(TAG, "CanonCamera 🔍 [R1 DOWNLOAD] --- Chunk #$chunkIndex --- | Offset: $offset (0x${offset.toString(16)}) | Requested Size: $chunkSize")
+
+            val partialCmd = handlerCommandRetry(session, worker) { GetPartialObject64Command(session, objR1.handlerID, offset, chunkSize) }
+            val result = partialCmd.getResult()
+            val chunk = result.getOrNull()
+
+            if (chunk == null) {
+                session.log.e(TAG, "CanonCamera ❌ [R1 DOWNLOAD] Chunk #$chunkIndex returned NULL at offset $offset. Error: ${result.exceptionOrNull()?.message}")
+                return null
+            }
+
+            imageBuffer.write(chunk)
+            offset += chunkSize
+            session.log.d(TAG, "CanonCamera 🔍 [R1 DOWNLOAD] Chunk #$chunkIndex success | Received: ${chunk.size} bytes | Total accumulated: ${imageBuffer.size()} / $totalBytes")
+        }
+
+        val imageBytes = imageBuffer.toByteArray()
+        session.log.d(TAG, "CanonCamera ✅ [R1 DOWNLOAD] Download complete for ${objR1.filename}! Total bytes: ${imageBytes.size}")
+
+        if (imageBytes.isEmpty()) {
+            session.log.e(TAG, "CanonCamera ❌ [R1 DOWNLOAD] Downloaded file is empty!")
+            return null
+        }
+
+        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, BitmapFactory.Options().apply { inSampleSize = 2 })
+        if (bitmap == null) {
+            session.log.e(TAG, "CanonCamera ❌ [R1 DOWNLOAD] Failed to decode bitmap for ${objR1.filename}! Data might be corrupted.")
+        }
+
+        val objectInfo = objR1.toObjectInfo()
+        return ObjectImage(objectInfo, objR1.handlerID, ImageObject(imageBytes, bitmap))
+    }
+
     private suspend fun onDownloadImage(worker: WorkerExecutor, handler: Int): ObjectImage? {
         val getObjectInfoCommand = handlerCommandRetry(session, worker) {
             GetObjectInfoCommand(session, handler)
         }
-        val objectInfo = getObjectInfoCommand.getResult().getOrNull()
 
+        getObjectInfoCommand.getResult().onFailure {
+            session.log.w(TAG, "CanonCamera onDownloadImage: failed when download info image $handler")
+        }
+
+        val objectInfo = getObjectInfoCommand.getResult().getOrNull()
         if (objectInfo == null) {
-            session.log.e(TAG, "onDownloadImage: failed when download info image $handler")
+            session.log.e(TAG, "CanonCamera onDownloadImage: failed when download info image")
             return null
         }
 
-        // ✅ R1: Route to appropriate download method based on camera model
-        return when (cameraModel) {
-            is CameraModel.R1 -> {
-                // Check if this specific file needs 64-bit (size > 2GB)
-                if (objectInfo.objectCompressedSize.toLong() > Int.MAX_VALUE.toLong()) {
-                    downloadImagePartial64(worker, handler, objectInfo)
-                } else {
-                    downloadImagePartial(worker, handler, objectInfo)
-                }
-            }
-            is CameraModel.Normal -> downloadImagePartial(worker, handler, objectInfo)
-            is CameraModel.Legacy -> downloadImage(worker, handler, objectInfo)
+        // ✅ Simplified: R1 is handled by onDownloadImageR1.
+        // We only need to check if the camera supports partial downloads (Normal) or not (Legacy).
+        return if (cameraModel != CameraModel.Legacy) {
+            downloadImagePartial(worker, handler, objectInfo)
+        } else {
+            downloadImage(worker, handler, objectInfo)
         }
     }
 
-    private suspend fun downloadImage(
-        worker: WorkerExecutor,
-        handler: Int,
-        objectInfo: ObjectInfo
-    ): ObjectImage? {
-        session.log.d(TAG, "downloadImage: start download image $handler")
-        val getObjectCommand = handlerCommandRetry(session, worker) {
-            GetObjectCommand(session, handler)
-        }
-        getObjectCommand.getResult().onFailure {
-            session.log.w(TAG, "downloadImage: failed when download image data $handler")
-        }
-        val imageObject = getObjectCommand.getResult().getOrNull()
-
-        if (imageObject == null) {
-            session.log.d(TAG, "downloadImage: failed when download image data")
-            return null
-        }
-
-        session.log.d(TAG, "downloadImage: finish download image")
+    private suspend fun downloadImage(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
+        val getObjectCommand = handlerCommandRetry(session, worker) { GetObjectCommand(session, handler) }
+        val imageObject = getObjectCommand.getResult().getOrNull() ?: return null
         return ObjectImage(objectInfo, handler, imageObject)
     }
 
-    private suspend fun downloadImagePartial(
-        worker: WorkerExecutor,
-        handler: Int,
-        objectInfo: ObjectInfo
-    ): ObjectImage? {
-        session.log.d(TAG, "downloadImagePartial: start download image $handler")
+    private suspend fun downloadImagePartial(worker: WorkerExecutor, handler: Int, objectInfo: ObjectInfo): ObjectImage? {
         var offset = 0
         val totalBytes = objectInfo.objectCompressedSize
         val imageTotalBytes = ByteBuffer.allocate(totalBytes)
-        imageTotalBytes.position(0)
         val maxPacketSize = 1024 * 1024
 
         while (offset < totalBytes) {
             var size = totalBytes - offset
-            if (size > maxPacketSize) {
-                size = maxPacketSize
-            }
-
-            val finalOffset = offset
-            val finalSize = size
-            val partialObjectCommand = handlerCommandRetry(session, worker) {
-                GetObjectPartial(session, handler, finalOffset, finalSize)
-            }
-            session.log.d(TAG, "downloadImagePartial: consume command")
-
-            partialObjectCommand.getResult().onFailure {
-                session.log.w(
-                    TAG,
-                    "downloadImagePartial: failed when download partial image $handler"
-                )
-            }
-            session.log.d(TAG, "downloadImagePartial: consume command done")
-
-            if (partialObjectCommand.getResult().getOrNull() == null) {
-                session.log.e(TAG, "downloadImagePartial: failed when download partial image")
-                return null
-            }
-
+            if (size > maxPacketSize) size = maxPacketSize
+            val partialObjectCommand = handlerCommandRetry(session, worker) { GetObjectPartial(session, handler, offset, size) }
+            if (partialObjectCommand.getResult().getOrNull() == null) return null
             val imageBytes = partialObjectCommand.getResult().getOrNull()?.clone() ?: return null
             imageTotalBytes.put(imageBytes, 0, imageBytes.size)
-
-            session.log.d(TAG, "downloadImagePartial: download with offset $offset with size $size")
             offset += size
-
-            if (!worker.isRunning()) {
-                return null
-            }
+            if (!worker.isRunning()) return null
         }
 
         val imageBytes = imageTotalBytes.array()
-        val bitmapOptions = BitmapFactory.Options()
-        bitmapOptions.inSampleSize = 2
-        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, bitmapOptions)
-
-        session.log.d(TAG, "downloadImagePartial: finish download image")
+        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, BitmapFactory.Options().apply { inSampleSize = 2 })
         return ObjectImage(objectInfo, handler, ImageObject(imageBytes, bitmap))
     }
 
-    // ✅ NEW: 64-bit partial download for R1 large files
-    private suspend fun downloadImagePartial64(
-        worker: WorkerExecutor,
-        handler: Int,
-        objectInfo: ObjectInfo
-    ): ObjectImage? {
-        session.log.d(TAG, "downloadImagePartial64: start download image $handler")
-
-        var offset: Long = 0L
-        val totalBytes = objectInfo.objectCompressedSize.toLong()
-        val imageBuffer = ByteArrayOutputStream()
-        val maxChunkSize = 2 * 1024 * 1024L  // 2MB chunks
-
-        while (offset < totalBytes && worker.isRunning()) {
-            val remaining = totalBytes - offset
-            val chunkSize = remaining.coerceAtMost(maxChunkSize).toInt()
-
-            val partialCmd = handlerCommandRetry(session, worker) {
-                GetPartialObject64Command(session, handler, offset, chunkSize)
-            }
-
-            val chunk = partialCmd.getResult().getOrNull() ?: return null
-            imageBuffer.write(chunk)
-
-            offset += chunkSize
-            session.log.d(TAG, "downloadImagePartial64: downloaded $offset/$totalBytes bytes")
-        }
-
-        val imageBytes = imageBuffer.toByteArray()
-        // Optional: decode thumbnail like partial version
-        val bitmapOptions = BitmapFactory.Options().apply { inSampleSize = 2 }
-        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, bitmapOptions)
-
-        return ObjectImage(objectInfo, handler, ImageObject(imageBytes, bitmap))
-    }
-
-    // ========== R1: Updated processStorageImages ==========
     private suspend fun processStorageImages(
-        executor: WorkerExecutor,
-        internalSession: Session,
-        storageId: Int,
-        skipAutoUpload: Boolean,
-        isR1Camera: Boolean = false  // ✅ NEW PARAM
+        executor: WorkerExecutor, internalSession: Session, storageId: Int,
+        skipAutoUpload: Boolean, isR1Camera: Boolean = false
     ): Boolean {
+        session.log.d(
+            TAG,
+            "CanonCamera 🔍 [R1 PROCESS] Starting processStorageImages for storage $storageId | skipAutoUpload: $skipAutoUpload | isR1: $isR1Camera"
+        )
 
-        // ✅ R1: Use DirObjectInfoList for faster listing
-        val handlersFromStorage: IntArray = if (isR1Camera && isExtendedEventEnabled) {
+        if (isR1Camera && isExtendedEventEnabled) {
+            session.log.d(
+                TAG,
+                "CanonCamera 🔍 [R1 PROCESS] R1 Camera detected. Bypassing GetNumObjects and scanning DirList directly..."
+            )
             val dirListCmd = GetDirObjectInfoListCommand(internalSession, storageId)
             executor.handleCommand(dirListCmd)
-            dirListCmd.getResult().getOrNull()?.map { it.handlerID }?.toIntArray() ?: intArrayOf()
-        } else {
-            val getObjectHandles = handlerCommandRetry(internalSession, executor) {
-                GetObjectHandlesCommand(internalSession, storageId, MtpConstants.FORMAT_EXIF_JPEG)
-            }
-            getObjectHandles.getResult().getOrNull() ?: intArrayOf()
-        }
+            val dirResult = dirListCmd.getResult()
+            val dirList = dirResult.getOrNull()
 
-        val handlerCleanFromRaw = handlersFromStorage.filter { !localRawDatabase.contains(it) }
+            if (dirResult.isSuccess && !dirList.isNullOrEmpty()) {
+                session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] DirList found ${dirList.size} objects.")
 
-        for (handlerId in handlerCleanFromRaw) {
-            if (localRawDatabase.contains(handlerId)) continue
-
-            val getObjectInfoCommand = handlerCommandRetry(internalSession, executor) {
-                GetObjectInfoCommand(internalSession, handlerId)
-            }
-            val objectInfo = getObjectInfoCommand.getResult().getOrNull() ?: continue
-            val filename = objectInfo.filename?.uppercase() ?: ""
-
-            if ((filename.endsWith(".JPEG") || filename.endsWith(".JPG")) &&
-                objectInfo.objectFormat == MtpConstants.FORMAT_EXIF_JPEG) {
-
-                // ✅ Consistent dedup key usage (match iOS: getAllDataKey)
-                val dedupKey = objectInfo.getAllDataKey()
-                if (localExifDatabaseNotFound.contains(dedupKey)) {
-                    continue
+                for (obj in dirList) {
+                    session.log.d(
+                        TAG,
+                        "CanonCamera 🔍 [R1 PROCESS] Object -> ID: 0x${obj.handlerID.toString(16)} | Name: ${obj.filename} | Format: 0x${
+                            obj.objectFormat.toString(16)
+                        } | Size: ${obj.objectSize64} | AlreadyProcessed: ${
+                            localRawDatabase.contains(
+                                obj.handlerID
+                            )
+                        }"
+                    )
                 }
 
-                val objectImage = onDownloadImage(executor, handlerId) ?: continue
-                val exifData = extractExifSignaturePartial(objectImage)
-                val enrichedImage = objectImage.copy(exifKey = exifData)
-                val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifData)
+                val newObjects = dirList.filter { !localRawDatabase.contains(it.handlerID) }
+                session.log.d(
+                    TAG,
+                    "CanonCamera 🔍 [R1 PROCESS] Found ${newObjects.size} new handlers to process."
+                )
 
-                // ✅ Check EXIF dedup with consistent key
-                if (exifData != null && exifData.isNotEmpty() && localExifDatabaseExist.contains(exifData)) {
-                    continue
-                }
+                for (objR1 in newObjects) {
+                    val filename = objR1.filename?.uppercase() ?: ""
+                    session.log.d(
+                        TAG,
+                        "CanonCamera 🔍 [R1 PROCESS] Checking handler 0x${objR1.handlerID.toString(16)} | File: $filename | Format: 0x${
+                            objR1.objectFormat.toString(16)
+                        }"
+                    )
 
-                val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
-                    objectInfoWithExif,
-                    skipAutoUpload
-                ) ?: false
+                    if ((filename.endsWith(".JPEG") || filename.endsWith(".JPG")) && objR1.objectFormat == MtpConstants.FORMAT_EXIF_JPEG) {
+                        val objectInfo = objR1.toObjectInfo()
+                        val dedupKey = objectInfo.getAllDataKey()
+                        if (localExifDatabaseNotFound.contains(dedupKey)) {
+                            session.log.d(
+                                TAG,
+                                "CanonCamera 🔍 [R1 PROCESS] Skipping $filename (dedupKey not found in DB)"
+                            )
+                            continue
+                        }
 
-                if (isExist) {
-                    // ✅ Update dedup sets with consistent keys
-                    if (exifData.isNullOrEmpty()) {
-                        localExifDatabaseNotFound.add(dedupKey)  // Use getAllDataKey()
+                        session.log.d(
+                            TAG,
+                            "CanonCamera 🔍 [R1 PROCESS] Triggering download for $filename..."
+                        )
+                        val objectImage = onDownloadImageR1(executor, objR1) ?: continue
+
+                        session.log.d(
+                            TAG,
+                            "CanonCamera 🔍 [R1 PROCESS] Extracting EXIF for $filename..."
+                        )
+                        val exifData = extractExifSignaturePartial(objectImage)
+                        val enrichedImage = objectImage.copy(exifKey = exifData)
+                        val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifData)
+
+                        if (exifData != null && exifData.isNotEmpty() && localExifDatabaseExist.contains(
+                                exifData
+                            )
+                        ) {
+                            session.log.d(
+                                TAG,
+                                "CanonCamera 🔍 [R1 PROCESS] Skipping $filename (EXIF already in DB)"
+                            )
+                            continue
+                        }
+
+                        session.log.d(
+                            TAG,
+                            "CanonCamera 🔍 [R1 PROCESS] Checking if $filename exists in user database..."
+                        )
+                        val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
+                            objectInfoWithExif,
+                            skipAutoUpload
+                        ) ?: false
+                        if (isExist) {
+                            session.log.d(
+                                TAG,
+                                "CanonCamera 🔍 [R1 PROCESS] $filename exists in user DB. Caching result."
+                            )
+                            if (exifData.isNullOrEmpty()) localExifDatabaseNotFound.add(dedupKey) else localExifDatabaseExist.add(
+                                exifData
+                            )
+                        } else {
+                            session.log.d(
+                                TAG,
+                                "CanonCamera 🔍 [R1 PROCESS] $filename is NEW! Consuming image..."
+                            )
+                            consumeImage(enrichedImage)
+                        }
                     } else {
-                        localExifDatabaseExist.add(exifData)
+                        session.log.d(
+                            TAG,
+                            "CanonCamera 🔍 [R1 PROCESS] Skipping non-JPEG file: $filename (Format: 0x${
+                                objR1.objectFormat.toString(16)
+                            })"
+                        )
+                        localRawDatabase.add(objR1.handlerID)
                     }
-                } else {
-                    consumeImage(enrichedImage)
                 }
             } else {
-                // Mark non-JPEG as processed
-                localRawDatabase.add(handlerId)
+                session.log.w(
+                    TAG,
+                    "CanonCamera ❌ [R1 PROCESS] DirList failed or empty. Result: ${dirResult.exceptionOrNull()?.message}"
+                )
+            }
+        } else {
+            val getObjectHandles = handlerCommandRetry(
+                internalSession,
+                executor
+            ) { GetObjectHandlesCommand(internalSession, storageId, MtpConstants.FORMAT_EXIF_JPEG) }
+            val handlersFromStorage = getObjectHandles.getResult().getOrNull() ?: intArrayOf()
+            val handlerCleanFromRaw = handlersFromStorage.filter { !localRawDatabase.contains(it) }
+
+            for (handlerId in handlerCleanFromRaw) {
+                if (localRawDatabase.contains(handlerId)) continue
+                val getObjectInfoCommand = handlerCommandRetry(internalSession, executor) {
+                    GetObjectInfoCommand(
+                        internalSession,
+                        handlerId
+                    )
+                }
+                val objectInfo = getObjectInfoCommand.getResult().getOrNull() ?: continue
+                val filename = objectInfo.filename?.uppercase() ?: ""
+                session.log.d(
+                    TAG,
+                    "CanonCamera 🖼️ [PROCESS] Normal Checking handler $handlerId | File: $filename | Format: ${objectInfo.objectFormat}"
+                )
+
+                if ((filename.endsWith(".JPEG") || filename.endsWith(".JPG")) && objectInfo.objectFormat == MtpConstants.FORMAT_EXIF_JPEG) {
+                    val dedupKey = objectInfo.getAllDataKey()
+                    if (localExifDatabaseNotFound.contains(dedupKey)) continue
+                    val objectImage = onDownloadImage(executor, handlerId) ?: continue
+                    val exifData = extractExifSignaturePartial(objectImage)
+                    val enrichedImage = objectImage.copy(exifKey = exifData)
+                    val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifData)
+                    if (exifData != null && exifData.isNotEmpty() && localExifDatabaseExist.contains(
+                            exifData
+                        )
+                    ) continue
+                    val isExist =
+                        listenerCamera?.onIsImageAlreadyInDatabase(objectInfoWithExif, skipAutoUpload)
+                            ?: false
+                    if (isExist) {
+                        if (exifData.isNullOrEmpty()) localExifDatabaseNotFound.add(dedupKey) else localExifDatabaseExist.add(
+                            exifData
+                        )
+                    } else {
+                        consumeImage(enrichedImage)
+                    }
+                } else {
+                    localRawDatabase.add(handlerId)
+                }
             }
         }
         return true
     }
 
-    private suspend fun <T: Command>handlerCommandRetry(session: Session,worker: WorkerExecutor, getCommand: ()-> T): T {
-        while(worker.isRunning()) {
+    private suspend fun <T : Command> handlerCommandRetry(session: Session, worker: WorkerExecutor, getCommand: () -> T): T {
+        while (worker.isRunning()) {
             val command = getCommand()
             worker.handleCommand(command)
-            if(!command.isRetry()) {
-                return command
-            }
-            session.log.e(TAG, "${command::class.simpleName} request retry")
+            if (!command.isRetry()) return command
+            session.log.e(TAG, "⚠️ [RETRY] CanonCamera ${command::class.simpleName} request retry")
             delay(500L)
         }
         error("Worker is shutting down")
     }
 
     private suspend fun extractExifSignaturePartial(objectImage: ObjectImage): String? {
-        return try {
-            val exifKey = generateExifUniqueKeyFromBytes(objectImage)
-            return exifKey
-
-        } catch (e: Exception) {
-            session.log.w(
-                TAG,
-                "❌ EXIF: Exception | handler=${objectImage.handlerId} | filename=${objectImage.objectInfo.filename} | error=${e.message}",
-                e
-            )
-            null
-        }
+        return try { generateExifUniqueKeyFromBytes(objectImage) } catch (e: Exception) { null }
     }
 
     private fun generateExifUniqueKeyFromBytes(objectImage: ObjectImage): String? {
         return try {
-            val objectInfo = objectImage.objectInfo
             val imageBytes = objectImage.image.bytes
-
-            // Quick size check before EXIF parsing
-            if (imageBytes.size < 128) {
-                session.log.d(
-                    TAG,
-                    "⚠️ SKIP EXIF: File too small | handler=${objectImage.handlerId} | filename=${objectInfo.filename} | size=${imageBytes.size}"
-                )
-                return null
-            }
-
+            if (imageBytes.size < 128) return null
             val exif = ExifInterface(ByteArrayInputStream(imageBytes))
-
             fun clean(value: String?): String = value?.trim()?.takeIf { it.isNotBlank() } ?: ""
-
             val make = clean(exif.getAttribute(ExifInterface.TAG_MAKE))
             val model = clean(exif.getAttribute(ExifInterface.TAG_MODEL))
             val dateTimeOriginal = clean(exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL))
-
-            // Subsec priority: digitized → original → empty
             val subSecDigitized = clean(exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_DIGITIZED))
             val subSecOriginal = clean(exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_ORIGINAL))
             val subSecTime = if (subSecDigitized.isNotEmpty()) subSecDigitized else subSecOriginal
-
-            val uniqueId = clean(
-                exif.getAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID)
-                    ?: exif.getAttribute("ImageUniqueID")
-            )
-
-            if (model.isEmpty() || dateTimeOriginal.isEmpty()) {
-                session.log.d(
-                    TAG,
-                    "⚠️ EXIF: Missing required fields | model=$model | dateTime=$dateTimeOriginal | filename=${objectInfo.filename}"
-                )
-                return null
-            }
-
-            val key = "${make}_${model}_${dateTimeOriginal}_${subSecTime}_${uniqueId}"
-            return key
-
-        } catch (e: Exception) {
-            session.log.w(
-                TAG,
-                "❌ EXIF: Parse failed | filename=${objectImage.objectInfo.filename} | error=${e.message}",
-                e
-            )
-            null
-        }
+            val uniqueId = clean(exif.getAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID) ?: exif.getAttribute("ImageUniqueID"))
+            if (model.isEmpty() || dateTimeOriginal.isEmpty()) return null
+            "${make}_${model}_${dateTimeOriginal}_${subSecTime}_${uniqueId}"
+        } catch (e: Exception) { null }
     }
 
-    //Consume Image logic: dedup check then callback
     private suspend fun consumeImage(objectImage: ObjectImage) {
-        val filename = objectImage.objectInfo.filename ?: "unknown"
         val exifData = objectImage.exifKey
-
         if (exifData.isNullOrEmpty()) {
             if (!localExifDatabaseNotFound.contains(objectImage.objectInfo.getAllDataKey())) {
                 localExifDatabaseNotFound.add(objectImage.objectInfo.getAllDataKey())
                 listenerCamera?.onImageDownloaded(objectImage)
-            } else {
             }
         } else {
             if (!localExifDatabaseExist.contains(exifData)) {
                 localExifDatabaseExist.add(exifData)
                 localRawDatabase.add(objectImage.handlerId)
                 listenerCamera?.onImageDownloaded(objectImage)
-            } else {
             }
         }
     }
 
-    companion object {
-        private const val TAG = "CanonCamera"
-    }
+    companion object { private const val TAG = "CanonCamera" }
 }

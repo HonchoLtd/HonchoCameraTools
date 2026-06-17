@@ -1,6 +1,8 @@
 package app.thehoncho.pronto.model
 
 // File: ObjectInfoR1.kt
+import android.util.Log
+import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.utils.PtpConstants
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -10,12 +12,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
-/**
- * R1-specific object info that mirrors ObjectInfo structure but parses R1 wire format.
- * Matches Swift ObjectInfoR1 struct pattern: properties can be set directly without buffer.
- */
 class ObjectInfoR1 {
-    // ========== Standard ObjectInfo-compatible properties (with defaults) ==========
     var handlerID: Int = 0
     var storageId: Int = 0
     var objectFormat: Int = 0
@@ -37,76 +34,70 @@ class ObjectInfoR1 {
     var modificationDate: String? = null
     var keywords: Int = 0
 
-    // ========== R1-specific extra fields ==========
-    var objectSize64: Long = 0L          // Full 64-bit file size
-    var timestampUnix: Int = 0           // Original Unix timestamp
-    var blockSize: Int = 0               // Struct size for padding skip
+    var objectSize64: Long = 0L
+    var timestampUnix: Int = 0
+    var blockSize: Int = 0
 
-    // ✅ Empty constructor - matches Swift struct pattern (no buffer required)
     constructor()
+    constructor(b: ByteBuffer, length: Int, session: Session) : this() { decode(b, length, session) }
 
-    // Optional: Constructor for parsing from ByteBuffer (when needed)
-    constructor(b: ByteBuffer, length: Int) : this() {
-        decode(b, length)
-    }
-
-    /**
-     * Decodes a SINGLE ObjectInfoR1 from ByteBuffer at current position.
-     * Format: [BlockSize 4][Handle 4][Storage 4][Format 4][Protect 4][Reserved 4]
-     *         [Size 8][Parent 4][Assoc 4][Timestamp 4][NameLen 1][UTF-16LE Name][Padding]
-     */
-    private fun decode(b: ByteBuffer, length: Int) {
+    private fun decode(b: ByteBuffer, length: Int, session: Session) {
         val originalOrder = b.order()
         b.order(ByteOrder.LITTLE_ENDIAN)
         val structStart = b.position()
 
         try {
-            // Parse R1 struct fields
+            // 1. Read the 4-byte header (Documentation calls it 172-byte struct size, but wire data is packed)
             blockSize = b.int
             handlerID = b.int
+
+            // 2. Standard PTP / Canon R1 fields
             storageId = b.int
-            objectFormat = b.int                 // R1 uses full int
+            objectFormat = b.int
             protectionStatus = b.int
-            b.int                                // Skip reserved field
+            val reserved = b.int
 
+            // 3. 64-bit File Size
             objectSize64 = b.long
-            objectCompressedSize = objectSize64.toInt()  // Truncate for compatibility
+            objectCompressedSize = objectSize64.toInt()
 
+            // 4. Hierarchy & Timestamp
             parentObject = b.int
-            associationType = b.int              // R1: associationHandle
-            timestampUnix = b.int                // Unix epoch timestamp
+            associationType = b.int
+            timestampUnix = b.int
 
-            // Filename: 1-byte length + UTF-16LE string
+            // 5. Filename (Custom R1 Encoding)
             val nameLength = b.get().toInt() and 0xFF
-            if (nameLength > 0) {
-                val nameBytes = ByteArray(nameLength * 2)
-                b.get(nameBytes)
-                filename = try {
-                    String(nameBytes, Charset.forName("UTF-16LE"))
-                        .trimEnd { it == '\u0000' || it == '\n' || it == '\r' }
-                } catch (e: Exception) {
-                    ""
+
+            if (nameLength > 0 && nameLength <= 255) {
+                if (b.remaining() >= nameLength * 2) {
+                    val nameBytes = ByteArray(nameLength * 2)
+                    b.get(nameBytes)
+
+                    // Extract low bytes (Canon R1 weird UTF-16LE variant)
+                    val cleanBytes = ByteArray(nameLength)
+                    for (i in 0 until nameLength) {
+                        cleanBytes[i] = nameBytes[i * 2]
+                    }
+
+                    filename = try {
+                        String(cleanBytes, Charsets.US_ASCII).trimEnd('\u0000', '\n', '\r')
+                    } catch (e: Exception) {
+                        session.log.w(TAG, "CanonCamera ⚠️ [DECODE] Filename decode failed: ${e.message}")
+                        ""
+                    }
+                } else {
+                    session.log.w(TAG, "CanonCamera ⚠️ [DECODE] Not enough bytes for filename")
+                    filename = ""
                 }
+            } else {
+                filename = ""
             }
 
-            // Convert Unix timestamp → PTP datetime string "YYYYMMDDTHHMMSS"
-            try {
-                val date = Date(timestampUnix.toLong() * 1000)
-                val sdf = SimpleDateFormat("yyyyMMdd'T'HHmmss", Locale.US)
-                sdf.timeZone = TimeZone.getTimeZone("UTC")
-                val ptpDate = sdf.format(date)
-                captureDate = ptpDate
-                modificationDate = ptpDate
-            } catch (e: Exception) {
-                captureDate = ""
-                modificationDate = ""
-            }
+//            session.log.d(TAG, "CanonCamera 🔍 [DECODE] Success: handler=0x${handlerID.toString(16)}, name='$filename', size=$objectSize64")
 
-            // Skip to end of struct block (handle padding)
-            val structEnd = structStart + blockSize
-            if (b.position() < structEnd) {
-                b.position(structEnd)
-            }
+        } catch (e: Exception) {
+            session.log.e(TAG, "CanonCamera ❌ [DECODE] Failed at pos=$structStart: ${e.message}", e)
         } finally {
             b.order(originalOrder)
         }
@@ -115,51 +106,55 @@ class ObjectInfoR1 {
     companion object {
         private const val TAG = "ObjectInfoR1"
 
-        /**
-         * Parse a list of ObjectInfoR1 from PTP response data.
-         * Matches Swift: ObjectInfoR1.parseList(from: data)
-         *
-         * Format: [Header 12 bytes][Item Count 4 bytes][Struct Array...]
-         */
-        fun parseList(data: ByteBuffer, totalLength: Int = 0): List<ObjectInfoR1> {
+        fun parseList(data: ByteBuffer, totalLength: Int = 0, session: Session): List<ObjectInfoR1> {
             val results = mutableListOf<ObjectInfoR1>()
             val originalOrder = data.order()
-
             data.order(ByteOrder.LITTLE_ENDIAN)
-
             try {
-                // Skip 12-byte PTP data header
-                if (data.position() < 12) data.position(12)
+//                session.log.d(TAG, "CanonCamera 🔍 [PARSE_LIST] Entry: position=${data.position()}, remaining=${data.remaining()}")
+
+                // Skip standard PTP Data Phase header if present (usually 12 bytes)
+                if (data.position() < 12 && data.remaining() > 12) {
+                    data.position(12)
+                }
 
                 if (data.remaining() < 4) return results
+
                 val itemCount = data.int
+//                session.log.d(TAG, "CanonCamera 🔍 [PARSE_LIST] Item count: $itemCount")
+
                 if (itemCount <= 0) return results
 
-                repeat(itemCount) {
-                    if (data.remaining() < 4) return@repeat
-                    val obj = ObjectInfoR1(data, data.remaining())
+                repeat(itemCount) { index ->
+                    if (data.remaining() < 4) {
+//                        session.log.w(TAG, "CanonCamera 🔍 [PARSE_LIST] Out of data at object #${index + 1}")
+                        return@repeat
+                    }
+
+                    val obj = ObjectInfoR1(data, data.remaining(), session)
+
                     if (obj.handlerID != 0 || !obj.filename.isNullOrEmpty()) {
                         results.add(obj)
+                    } else {
+//                        session.log.w(TAG, "CanonCamera 🔍 [PARSE_LIST] Skipped empty object #${index + 1}")
                     }
                 }
+//                session.log.d(TAG, "CanonCamera 🔍 [PARSE_LIST] Finished: ${results.size} valid objects")
             } catch (e: Exception) {
-                android.util.Log.w(TAG, "Failed to parse ObjectInfoR1 list", e)
+//                session.log.w(TAG, "CanonCamera 🔍 [PARSE_LIST] Failed: ${e.message}", e)
             } finally {
                 data.order(originalOrder)
             }
-
             return results
         }
     }
-
-    // ========== Compatibility Methods (match ObjectInfo) ==========
 
     override fun toString(): String {
         return buildString {
             append("ObjectInfoR1\n")
             append("HandlerID: 0x%08x\n".format(handlerID))
             append("StorageId: 0x%08x\n".format(storageId))
-            append("ObjectFormat: ${PtpConstants.objectFormatToString(objectFormat)}\n")
+            append("ObjectFormat: ${app.thehoncho.pronto.utils.PtpConstants.objectFormatToString(objectFormat)}\n")
             append("ProtectionStatus: $protectionStatus\n")
             append("ObjectCompressedSize: $objectCompressedSize (64-bit: $objectSize64)\n")
             append("ParentObject: 0x%08x\n".format(parentObject))
@@ -170,15 +165,13 @@ class ObjectInfoR1 {
     }
 
     fun getID(): String {
-        return listOf(
-            handlerID.toString(), storageId.toString(), objectFormat.toString(),
+        return listOf(handlerID.toString(), storageId.toString(), objectFormat.toString(),
             parentObject.toString(), captureDate ?: "", modificationDate ?: "", filename ?: ""
         ).joinToString(".").replace("\u0000", "")
     }
 
     fun getAllDataKey(): String {
-        return listOf(
-            handlerID.toString(), storageId.toString(), objectFormat.toString(),
+        return listOf(handlerID.toString(), storageId.toString(), objectFormat.toString(),
             protectionStatus.toString(), objectCompressedSize.toString(),
             thumbFormat.toString(), thumbCompressedSize.toString(),
             thumbPixWidth.toString(), thumbPixHeight.toString(),
@@ -191,74 +184,30 @@ class ObjectInfoR1 {
         ).joinToString(".").replace("\u0000", "")
     }
 
-    // ========== R1-Specific Helpers ==========
-
     fun requires64BitDownload(): Boolean = objectSize64 > Int.MAX_VALUE.toLong()
 
-    /**
-     * Convert to standard ObjectInfo for compatibility.
-     *
-     * ⚠️ Since ObjectInfo requires (ByteBuffer, Int) constructor, we have two options:
-     */
     fun toObjectInfo(): ObjectInfo {
-        // OPTION 1 (Recommended): Add no-arg constructor to ObjectInfo (see below)
-        // return ObjectInfo().apply { copyFieldsFrom(this@ObjectInfoR1) }
-
-        // OPTION 2 (Workaround): Use a minimal dummy buffer if you can't modify ObjectInfo
-        return createObjectInfoWithDummyBuffer().apply { copyFieldsFrom(this@ObjectInfoR1) }
-    }
-
-    // Helper to copy all compatible fields
-    private fun ObjectInfo.copyFieldsFrom(r1: ObjectInfoR1) {
-        handlerID = r1.handlerID
-        storageId = r1.storageId
-        objectFormat = r1.objectFormat
-        protectionStatus = r1.protectionStatus
-        objectCompressedSize = r1.objectCompressedSize
-        thumbFormat = r1.thumbFormat
-        thumbCompressedSize = r1.thumbCompressedSize
-        thumbPixWidth = r1.thumbPixWidth
-        thumbPixHeight = r1.thumbPixHeight
-        imagePixWidth = r1.imagePixWidth
-        imagePixHeight = r1.imagePixHeight
-        imageBitDepth = r1.imageBitDepth
-        parentObject = r1.parentObject
-        associationType = r1.associationType
-        associationDesc = r1.associationDesc
-        sequenceNumber = r1.sequenceNumber
-        filename = r1.filename
-        captureDate = r1.captureDate
-        modificationDate = r1.modificationDate
-        keywords = r1.keywords
-    }
-
-    // Workaround: Create ObjectInfo using minimal dummy buffer
-    private fun createObjectInfoWithDummyBuffer(): ObjectInfo {
-        // Allocate buffer with minimal valid data for decode() to not crash
-        val dummy = ByteBuffer.allocate(256).order(ByteOrder.LITTLE_ENDIAN)
-        // Write minimal valid structure for decode()
-        dummy.putInt(0)       // storageId
-        dummy.putShort(0)     // objectFormat
-        dummy.putShort(0)     // protectionStatus
-        dummy.putInt(0)       // objectCompressedSize
-        dummy.putShort(0)     // thumbFormat
-        dummy.putInt(0)       // thumbCompressedSize
-        dummy.putInt(0)       // thumbPixWidth
-        dummy.putInt(0)       // thumbPixHeight
-        dummy.putInt(0)       // imagePixWidth
-        dummy.putInt(0)       // imagePixHeight
-        dummy.putInt(0)       // imageBitDepth
-        dummy.putInt(0)       // parentObject
-        dummy.putShort(0)     // associationType
-        dummy.putInt(0)       // associationDesc
-        dummy.putInt(0)       // sequenceNumber
-        // Minimal strings for PacketUtil.readString()
-        dummy.put(byteArrayOf(0))  // empty filename
-        dummy.put(byteArrayOf(0))  // empty captureDate
-        dummy.put(byteArrayOf(0))  // empty modificationDate
-        dummy.put(0)          // keywords
-        dummy.position(0)     // Reset for decode()
-
-        return ObjectInfo(dummy, 256)
+        return ObjectInfo().apply {
+            handlerID = this@ObjectInfoR1.handlerID
+            storageId = this@ObjectInfoR1.storageId
+            objectFormat = this@ObjectInfoR1.objectFormat
+            protectionStatus = this@ObjectInfoR1.protectionStatus
+            objectCompressedSize = this@ObjectInfoR1.objectCompressedSize
+            thumbFormat = this@ObjectInfoR1.thumbFormat
+            thumbCompressedSize = this@ObjectInfoR1.thumbCompressedSize
+            thumbPixWidth = this@ObjectInfoR1.thumbPixWidth
+            thumbPixHeight = this@ObjectInfoR1.thumbPixHeight
+            imagePixWidth = this@ObjectInfoR1.imagePixWidth
+            imagePixHeight = this@ObjectInfoR1.imagePixHeight
+            imageBitDepth = this@ObjectInfoR1.imageBitDepth
+            parentObject = this@ObjectInfoR1.parentObject
+            associationType = this@ObjectInfoR1.associationType
+            associationDesc = this@ObjectInfoR1.associationDesc
+            sequenceNumber = this@ObjectInfoR1.sequenceNumber
+            filename = this@ObjectInfoR1.filename
+            captureDate = this@ObjectInfoR1.captureDate
+            modificationDate = this@ObjectInfoR1.modificationDate
+            keywords = this@ObjectInfoR1.keywords
+        }
     }
 }
