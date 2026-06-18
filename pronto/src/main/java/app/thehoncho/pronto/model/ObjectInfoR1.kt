@@ -84,7 +84,6 @@ class ObjectInfoR1 {
             } else {
                 filename = ""
             }
-
         } finally {
             b.order(originalOrder)
         }

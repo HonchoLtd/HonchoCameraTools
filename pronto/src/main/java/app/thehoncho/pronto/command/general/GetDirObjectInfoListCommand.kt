@@ -10,8 +10,8 @@ import java.nio.ByteOrder
 class GetDirObjectInfoListCommand(
     session: Session,
     private val storageId: Int,
-    private val parentHandle: Int = 0x63200000,
-    private val formatFilter: Int = 0x00200000
+    private val parentHandle: Int = -1,
+    private val formatFilter: Int = -1
 ) : Command(session) {
 
     private var objectList: List<ObjectInfoR1> = emptyList()
@@ -37,7 +37,6 @@ class GetDirObjectInfoListCommand(
     override fun decodeData(b: ByteBuffer, length: Int) {
         try {
             objectList = ObjectInfoR1.parseList(b, length)
-            session.log.d(TAG, "GetDirObjectInfoList: Parsed ${objectList.size} objects")
         } catch (e: Exception) {
             session.log.e(TAG, "Failed to decode GetDirObjectInfoList data", e)
             this.throwable = e

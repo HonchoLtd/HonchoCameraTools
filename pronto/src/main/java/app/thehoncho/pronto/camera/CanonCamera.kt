@@ -107,13 +107,10 @@ class CanonCamera(private val session: Session) : BaseCamera() {
 
                 for (storageId in validStorageIds) {
                     if (isR1Camera && isExtendedEventEnabled) {
-                        val dirListCmd = GetDirObjectInfoListCommand(session, storageId)
-                        executor.handleCommand(dirListCmd)
+                        // 🔄 Use the new recursive crawler to get ALL files from ALL folders
+                        val dirList = crawlStorage(executor, session, storageId)
 
-                        val dirResult = dirListCmd.getResult()
-                        val dirList = dirResult.getOrNull()
-
-                        if (dirResult.isSuccess && !dirList.isNullOrEmpty()) {
+                        if (dirList.isNotEmpty()) {
                             for (objR1 in dirList) {
                                 if (localRawDatabase.contains(objR1.handlerID)) continue
                                 val objectInfo = objR1.toObjectInfo()
@@ -177,13 +174,7 @@ class CanonCamera(private val session: Session) : BaseCamera() {
             }
 
             // 🚨 FIX 1: Trigger processing if we have events OR if we are waiting for a 0-byte file to finish writing
-            if (hasEvents || hasUnfinishedFiles) {
-                if (hasUnfinishedFiles && !hasEvents) {
-                    session.log.w(TAG, "CanonCamera 🚨 [R1 PROOF] FORCED RE-READ! No new event from camera, but hasUnfinishedFiles is true.")
-                } else if (hasEvents) {
-                    session.log.d(TAG, "CanonCamera 🔍 [R1 EVENT] 📸 Events detected! Checking storages...")
-                }
-
+            if (hasEvents) {
                 for (storageId in validStorageIds) {
                     if (isR1Camera) {
                         processStorageImages(executor, session, storageId, skipAutoUpload = false, isR1Camera = true)
@@ -368,57 +359,90 @@ class CanonCamera(private val session: Session) : BaseCamera() {
         return ObjectImage(objectInfo, handler, ImageObject(imageBytes, bitmap))
     }
 
+    /**
+     * Recursively crawls through the Storage Root and all its subfolders (DCIM, 100CANON, etc.)
+     * to gather all JPEG files into a single flat list.
+     */
+    private suspend fun crawlStorage(
+        executor: WorkerExecutor,
+        session: Session,
+        storageId: Int
+    ): List<ObjectInfoR1> {
+        val allObjects = mutableListOf<ObjectInfoR1>()
+
+        data class CrawlFolder(val handle: Int, val name: String, val parentHandle: Int)
+        val foldersToProcess = ArrayDeque<CrawlFolder>()
+        val visitedFolders = mutableSetOf<Int>()
+        val addedObjectIds = mutableSetOf<Int>() // Prevent duplicates if camera returns overlapping data
+
+        // 🚨 Start at -1 (0xFFFFFFFF), which is the standard PTP root handle.
+        val rootHandle = -1
+        foldersToProcess.add(CrawlFolder(rootHandle, "Storage Root", 0))
+        visitedFolders.add(rootHandle)
+        while (foldersToProcess.isNotEmpty() && executor.isRunning()) {
+            val currentFolder = foldersToProcess.removeFirst()
+
+            // Because parentHandle and formatFilter default to -1, we don't need to pass them!
+            val dirListCmd = GetDirObjectInfoListCommand(session, storageId, currentFolder.handle)
+            executor.handleCommand(dirListCmd)
+            val dirResult = dirListCmd.getResult()
+            val dirList = dirResult.getOrNull() ?: continue
+
+            if (dirList.isEmpty()) {
+                session.log.w(TAG, "CanonCamera 🔍 [R1 CRAWL] ⚠️ Folder 0x${currentFolder.handle.toString(16)} returned 0 items.")
+                continue
+            }
+
+            for (obj in dirList) {
+                // 1. Check if it's a Folder (Format Code 0x3001)
+                if (obj.objectFormat == MtpConstants.FORMAT_ASSOCIATION) {
+                    val folderName = obj.filename ?: "UnknownFolder"
+
+                    // Add to queue to be crawled on the next loop
+                    if (!visitedFolders.contains(obj.handlerID)) {
+                        visitedFolders.add(obj.handlerID)
+                        foldersToProcess.add(CrawlFolder(obj.handlerID, folderName, obj.parentObject))
+                    }
+                }
+                // 2. It's a file. Check if it's a JPEG!
+                else {
+                    val name = obj.filename?.uppercase() ?: ""
+                    val isJpeg = name.endsWith(".JPG") ||
+                            name.endsWith(".JPEG") ||
+                            obj.objectFormat == MtpConstants.FORMAT_EXIF_JPEG
+
+                    if (isJpeg) {
+                        if (!addedObjectIds.contains(obj.handlerID)) {
+                            addedObjectIds.add(obj.handlerID)
+                            allObjects.add(obj)
+                        }
+                    } else {
+                        session.log.w(TAG, "CanonCamera 🔍 [R1 CRAWL] ⏭️ Ignoring non-JPEG file: '${obj.filename}'")
+                    }
+                }
+            }
+        }
+
+        return allObjects
+    }
+
     private suspend fun processStorageImages(
         executor: WorkerExecutor, internalSession: Session, storageId: Int,
         skipAutoUpload: Boolean, isR1Camera: Boolean = false
     ): Boolean {
-        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Starting processStorageImages for storage $storageId | isR1: $isR1Camera")
-
         if (isR1Camera && isExtendedEventEnabled) {
-            val dirListCmd = GetDirObjectInfoListCommand(internalSession, storageId)
-            executor.handleCommand(dirListCmd)
-            val dirResult = dirListCmd.getResult()
-            val dirList = dirResult.getOrNull()
+            // 🔄 Use the new recursive crawler to get ALL files from ALL folders
+            val dirList = crawlStorage(executor, internalSession, storageId)
 
-            if (dirResult.isSuccess && !dirList.isNullOrEmpty()) {
-                session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] DirList found ${dirList.size} total objects.")
-
+            if (dirList.isNotEmpty()) {
                 val newObjects = dirList.filter { !localRawDatabase.contains(it.handlerID) }
 
-                // 🚨 FIX 3: Check if there are any 0-byte JPEGs to manage the flag
-                val hasZeroSizeJpeg = newObjects.any {
-                    val name = it.filename?.uppercase() ?: ""
-                    (name.endsWith(".JPEG") || name.endsWith(".JPG")) && it.objectSize64 == 0L
-                }
-
-                if (hasZeroSizeJpeg) {
-                    // Find the specific file to log its exact name
-                    val zeroSizeFile = newObjects.first {
-                        val name = it.filename?.uppercase() ?: ""
-                        (name.endsWith(".JPEG") || name.endsWith(".JPG")) && it.objectSize64 == 0L
-                    }
-
-                    // 🚨 PROOF LOG 1: This will ONLY print if a 0-byte file is actually caught
-                    session.log.w(TAG, "CanonCamera 🚨 [R1 PROOF] CAUGHT 0-BYTE FILE! Name: ${zeroSizeFile.filename} | ID: 0x${zeroSizeFile.handlerID.toString(16)}. Setting hasUnfinishedFiles = true")
-                    hasUnfinishedFiles = true
-                } else {
-                    // Only log the clearing of the flag so we don't spam the logcat on every normal loop
-                    if (hasUnfinishedFiles) {
-                        session.log.d(TAG, "CanonCamera ✅ [R1 PROOF] File finished writing! Size is now > 0. Clearing hasUnfinishedFiles flag.")
-                    }
-                    hasUnfinishedFiles = false
-                }
-
                 if (newObjects.isEmpty()) {
-                    session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] No new objects found. All items already processed.")
                     return true
                 }
 
-                session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Found ${newObjects.size} NEW handlers to process.")
-
                 for (objR1 in newObjects) {
                     val filename = objR1.filename?.uppercase() ?: ""
-                    session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Processing NEW file: $filename | ID: 0x${objR1.handlerID.toString(16)} | Size: ${objR1.objectSize64}")
 
                     if (objR1.objectSize64 == 0L) {
                         session.log.w(TAG, "CanonCamera ⚠️ [R1 PROCESS] File $filename has size 0. Camera is still writing. Waiting for next loop...")
@@ -430,38 +454,30 @@ class CanonCamera(private val session: Session) : BaseCamera() {
                         val objectInfo = objR1.toObjectInfo()
                         val dedupKey = objectInfo.getAllDataKey()
                         if (localExifDatabaseNotFound.contains(dedupKey)) {
-                            session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Skipping $filename (dedupKey not found in DB)")
-                            localRawDatabase.add(objR1.handlerID) // 🚨 FIX 4: Mark as processed!
+                            localRawDatabase.add(objR1.handlerID)
                             continue
                         }
 
-                        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Triggering download for $filename...")
                         val objectImage = onDownloadImageR1(executor, objR1) ?: continue
 
-                        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Extracting EXIF for $filename...")
                         val exifData = extractExifSignaturePartial(objectImage)
                         val enrichedImage = objectImage.copy(exifKey = exifData)
                         val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifData)
 
                         if (exifData != null && exifData.isNotEmpty() && localExifDatabaseExist.contains(exifData)) {
-                            session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Skipping $filename (EXIF already in DB)")
-                            localRawDatabase.add(objR1.handlerID) // 🚨 FIX 4: Mark as processed!
+                            localRawDatabase.add(objR1.handlerID)
                             continue
                         }
 
-                        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Checking if $filename exists in user database...")
                         val isExist = listenerCamera?.onIsImageAlreadyInDatabase(objectInfoWithExif, skipAutoUpload) ?: false
                         if (isExist) {
-                            session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] $filename exists in user DB. Caching result.")
                             if (exifData.isNullOrEmpty()) localExifDatabaseNotFound.add(dedupKey) else localExifDatabaseExist.add(exifData)
-                            localRawDatabase.add(objR1.handlerID) // 🚨 FIX 4: Mark as processed!
+                            localRawDatabase.add(objR1.handlerID)
                         } else {
-                            session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] $filename is NEW! Consuming image...")
                             consumeImage(enrichedImage)
-                            localRawDatabase.add(objR1.handlerID) // 🚨 FIX 4: Mark as processed!
+                            localRawDatabase.add(objR1.handlerID)
                         }
                     } else {
-                        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Skipping non-JPEG file: $filename")
                         localRawDatabase.add(objR1.handlerID)
                     }
                 }
