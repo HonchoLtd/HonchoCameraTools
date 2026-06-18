@@ -50,6 +50,7 @@ class CanonCamera(private val session: Session) : BaseCamera() {
     private val localExifDatabaseExist = mutableSetOf<String>()
     private val localExifDatabaseNotFound = mutableSetOf<String>()
     private var isSkipAutoUpload = true
+    private var hasUnfinishedFiles = false
 
     override fun execute(executor: WorkerExecutor) = runBlocking {
         val deviceInfo = onConnecting(executor)
@@ -68,8 +69,9 @@ class CanonCamera(private val session: Session) : BaseCamera() {
             executor.handleCommand(setExtendedEventCmd)
             setExtendedEventCmd.getResult().onSuccess {
                 isExtendedEventEnabled = true
+                session.log.d(TAG, "CanonCamera 🔍 [R1 INIT] ✅ Extended events enabled successfully.")
             }.onFailure {
-                session.log.w(TAG, "⚠️ [R1] CanonCamera Failed to enable extended events. Will use standard polling.")
+                session.log.w(TAG, "CanonCamera ⚠️ [R1 INIT] Failed to enable extended events. Will use standard polling.")
             }
         }
 
@@ -114,7 +116,6 @@ class CanonCamera(private val session: Session) : BaseCamera() {
                         if (dirResult.isSuccess && !dirList.isNullOrEmpty()) {
                             for (objR1 in dirList) {
                                 if (localRawDatabase.contains(objR1.handlerID)) continue
-                                // ✅ Clean conversion without dummy buffer!
                                 val objectInfo = objR1.toObjectInfo()
                                 allObjectInfos.add(objectInfo)
                             }
@@ -170,29 +171,47 @@ class CanonCamera(private val session: Session) : BaseCamera() {
             val result = getEventCommand.getResult()
             val hasEvents = result.getOrNull() ?: false
 
-            if (result.isFailure || !hasEvents) delay(100L)
+            // 🔍 LOG EVENT POLLING RESULT
+            if (isR1Camera) {
+                session.log.d(TAG, "CanonCamera 🔍 [R1 EVENT] Poll result: hasEvents=$hasEvents, responseCode=0x${responseCode.toString(16)}")
+            }
 
-            if (hasEvents) {
+            // 🚨 FIX 1: Trigger processing if we have events OR if we are waiting for a 0-byte file to finish writing
+            if (hasEvents || hasUnfinishedFiles) {
+                if (hasUnfinishedFiles && !hasEvents) {
+                    session.log.w(TAG, "CanonCamera 🚨 [R1 PROOF] FORCED RE-READ! No new event from camera, but hasUnfinishedFiles is true.")
+                } else if (hasEvents) {
+                    session.log.d(TAG, "CanonCamera 🔍 [R1 EVENT] 📸 Events detected! Checking storages...")
+                }
+
                 for (storageId in validStorageIds) {
                     if (isR1Camera) {
                         processStorageImages(executor, session, storageId, skipAutoUpload = false, isR1Camera = true)
                     } else {
-                        val getNumObjects = handlerCommandRetry(session, executor) { GetNumObjectsCommand(session, storageId) }
-                        val numResult = getNumObjects.getResult()
+                        // Normal cameras still use GetNumObjects
+                        val cmd = handlerCommandRetry(session, executor) { GetNumObjectsCommand(session, storageId) }
+                        val numResult = cmd.getResult()
+
                         if (numResult.isSuccess) {
                             val currentCount = numResult.getOrDefault(0)
                             val previousCount = objectCountByStorage[storageId] ?: 0
+
                             if (currentCount != previousCount) {
                                 objectCountByStorage[storageId] = currentCount
                                 processStorageImages(executor, session, storageId, skipAutoUpload = false, isR1Camera = false)
+                            } else {
+                                session.log.d(TAG, "CanonCamera 🔍 [EVENT] Count unchanged ($currentCount). Ignoring redundant event.")
                             }
                         } else {
-                            session.log.e(TAG, "❌ [EVENT] CanonCamera GetNumObjects FAILED (Code: ${getNumObjects.responseCode})! Waiting 1s...")
-                            delay(1000L)
+                            session.log.w(TAG, "CanonCamera ⚠️ [EVENT] GetNumObjects failed. Falling back to directory read...")
+                            processStorageImages(executor, session, storageId, skipAutoUpload = false, isR1Camera = false)
                         }
                     }
                 }
             }
+
+            if (result.isFailure || !hasEvents) delay(100L)
+
         }
         listenerCamera?.onStop()
     }
@@ -249,6 +268,7 @@ class CanonCamera(private val session: Session) : BaseCamera() {
     }
 
     private suspend fun downloadImagePartial64R1(worker: WorkerExecutor, objR1: ObjectInfoR1): ObjectImage? {
+        session.log.d(TAG, "CanonCamera 🔍 [R1 DOWNLOAD] Starting download for handler 0x${objR1.handlerID.toString(16)} | File: ${objR1.filename} | Size: ${objR1.objectSize64}")
         var offset: Long = 0L
         val totalBytes = objR1.objectSize64
 
@@ -265,6 +285,7 @@ class CanonCamera(private val session: Session) : BaseCamera() {
             chunkIndex++
             val remaining = totalBytes - offset
             val chunkSize = remaining.coerceAtMost(maxChunkSize).toInt()
+            session.log.d(TAG, "CanonCamera 🔍 [R1 DOWNLOAD] --- Chunk #$chunkIndex --- | Offset: $offset | Requested Size: $chunkSize")
 
             val partialCmd = handlerCommandRetry(session, worker) { GetPartialObject64Command(session, objR1.handlerID, offset, chunkSize) }
             val result = partialCmd.getResult()
@@ -277,9 +298,11 @@ class CanonCamera(private val session: Session) : BaseCamera() {
 
             imageBuffer.write(chunk)
             offset += chunkSize
+            session.log.d(TAG, "CanonCamera 🔍 [R1 DOWNLOAD] Chunk #$chunkIndex success | Received: ${chunk.size} bytes | Total accumulated: ${imageBuffer.size()} / $totalBytes")
         }
 
         val imageBytes = imageBuffer.toByteArray()
+        session.log.d(TAG, "CanonCamera ✅ [R1 DOWNLOAD] Download complete for ${objR1.filename}! Total bytes: ${imageBytes.size}")
 
         if (imageBytes.isEmpty()) {
             session.log.e(TAG, "CanonCamera ❌ [R1 DOWNLOAD] Downloaded file is empty!")
@@ -310,8 +333,6 @@ class CanonCamera(private val session: Session) : BaseCamera() {
             return null
         }
 
-        // ✅ Simplified: R1 is handled by onDownloadImageR1.
-        // We only need to check if the camera supports partial downloads (Normal) or not (Legacy).
         return if (cameraModel != CameraModel.Legacy) {
             downloadImagePartial(worker, handler, objectInfo)
         } else {
@@ -351,6 +372,8 @@ class CanonCamera(private val session: Session) : BaseCamera() {
         executor: WorkerExecutor, internalSession: Session, storageId: Int,
         skipAutoUpload: Boolean, isR1Camera: Boolean = false
     ): Boolean {
+        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Starting processStorageImages for storage $storageId | isR1: $isR1Camera")
+
         if (isR1Camera && isExtendedEventEnabled) {
             val dirListCmd = GetDirObjectInfoListCommand(internalSession, storageId)
             executor.handleCommand(dirListCmd)
@@ -358,65 +381,102 @@ class CanonCamera(private val session: Session) : BaseCamera() {
             val dirList = dirResult.getOrNull()
 
             if (dirResult.isSuccess && !dirList.isNullOrEmpty()) {
+                session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] DirList found ${dirList.size} total objects.")
+
                 val newObjects = dirList.filter { !localRawDatabase.contains(it.handlerID) }
+
+                // 🚨 FIX 3: Check if there are any 0-byte JPEGs to manage the flag
+                val hasZeroSizeJpeg = newObjects.any {
+                    val name = it.filename?.uppercase() ?: ""
+                    (name.endsWith(".JPEG") || name.endsWith(".JPG")) && it.objectSize64 == 0L
+                }
+
+                if (hasZeroSizeJpeg) {
+                    // Find the specific file to log its exact name
+                    val zeroSizeFile = newObjects.first {
+                        val name = it.filename?.uppercase() ?: ""
+                        (name.endsWith(".JPEG") || name.endsWith(".JPG")) && it.objectSize64 == 0L
+                    }
+
+                    // 🚨 PROOF LOG 1: This will ONLY print if a 0-byte file is actually caught
+                    session.log.w(TAG, "CanonCamera 🚨 [R1 PROOF] CAUGHT 0-BYTE FILE! Name: ${zeroSizeFile.filename} | ID: 0x${zeroSizeFile.handlerID.toString(16)}. Setting hasUnfinishedFiles = true")
+                    hasUnfinishedFiles = true
+                } else {
+                    // Only log the clearing of the flag so we don't spam the logcat on every normal loop
+                    if (hasUnfinishedFiles) {
+                        session.log.d(TAG, "CanonCamera ✅ [R1 PROOF] File finished writing! Size is now > 0. Clearing hasUnfinishedFiles flag.")
+                    }
+                    hasUnfinishedFiles = false
+                }
+
+                if (newObjects.isEmpty()) {
+                    session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] No new objects found. All items already processed.")
+                    return true
+                }
+
+                session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Found ${newObjects.size} NEW handlers to process.")
+
                 for (objR1 in newObjects) {
                     val filename = objR1.filename?.uppercase() ?: ""
+                    session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Processing NEW file: $filename | ID: 0x${objR1.handlerID.toString(16)} | Size: ${objR1.objectSize64}")
+
+                    if (objR1.objectSize64 == 0L) {
+                        session.log.w(TAG, "CanonCamera ⚠️ [R1 PROCESS] File $filename has size 0. Camera is still writing. Waiting for next loop...")
+                        // DO NOT add to localRawDatabase! We will catch it on the next loop when size > 0.
+                        continue
+                    }
 
                     if ((filename.endsWith(".JPEG") || filename.endsWith(".JPG")) && objR1.objectFormat == MtpConstants.FORMAT_EXIF_JPEG) {
                         val objectInfo = objR1.toObjectInfo()
                         val dedupKey = objectInfo.getAllDataKey()
                         if (localExifDatabaseNotFound.contains(dedupKey)) {
+                            session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Skipping $filename (dedupKey not found in DB)")
+                            localRawDatabase.add(objR1.handlerID) // 🚨 FIX 4: Mark as processed!
                             continue
                         }
 
+                        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Triggering download for $filename...")
                         val objectImage = onDownloadImageR1(executor, objR1) ?: continue
+
+                        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Extracting EXIF for $filename...")
                         val exifData = extractExifSignaturePartial(objectImage)
                         val enrichedImage = objectImage.copy(exifKey = exifData)
                         val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifData)
 
-                        if (exifData != null && exifData.isNotEmpty() && localExifDatabaseExist.contains(
-                                exifData
-                            )
-                        ) {
+                        if (exifData != null && exifData.isNotEmpty() && localExifDatabaseExist.contains(exifData)) {
+                            session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Skipping $filename (EXIF already in DB)")
+                            localRawDatabase.add(objR1.handlerID) // 🚨 FIX 4: Mark as processed!
                             continue
                         }
-                        val isExist = listenerCamera?.onIsImageAlreadyInDatabase(
-                            objectInfoWithExif,
-                            skipAutoUpload
-                        ) ?: false
+
+                        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Checking if $filename exists in user database...")
+                        val isExist = listenerCamera?.onIsImageAlreadyInDatabase(objectInfoWithExif, skipAutoUpload) ?: false
                         if (isExist) {
-                            if (exifData.isNullOrEmpty()) localExifDatabaseNotFound.add(dedupKey) else localExifDatabaseExist.add(
-                                exifData
-                            )
+                            session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] $filename exists in user DB. Caching result.")
+                            if (exifData.isNullOrEmpty()) localExifDatabaseNotFound.add(dedupKey) else localExifDatabaseExist.add(exifData)
+                            localRawDatabase.add(objR1.handlerID) // 🚨 FIX 4: Mark as processed!
                         } else {
+                            session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] $filename is NEW! Consuming image...")
                             consumeImage(enrichedImage)
+                            localRawDatabase.add(objR1.handlerID) // 🚨 FIX 4: Mark as processed!
                         }
                     } else {
+                        session.log.d(TAG, "CanonCamera 🔍 [R1 PROCESS] Skipping non-JPEG file: $filename")
                         localRawDatabase.add(objR1.handlerID)
                     }
                 }
             } else {
-                session.log.w(
-                    TAG,
-                    "CanonCamera ❌ [R1 PROCESS] DirList failed or empty. Result: ${dirResult.exceptionOrNull()?.message}"
-                )
+                session.log.w(TAG, "CanonCamera ❌ [R1 PROCESS] DirList failed or empty.")
             }
         } else {
-            val getObjectHandles = handlerCommandRetry(
-                internalSession,
-                executor
-            ) { GetObjectHandlesCommand(internalSession, storageId, MtpConstants.FORMAT_EXIF_JPEG) }
+            // --- NORMAL CAMERA LOGIC (Unchanged) ---
+            val getObjectHandles = handlerCommandRetry(internalSession, executor) { GetObjectHandlesCommand(internalSession, storageId, MtpConstants.FORMAT_EXIF_JPEG) }
             val handlersFromStorage = getObjectHandles.getResult().getOrNull() ?: intArrayOf()
             val handlerCleanFromRaw = handlersFromStorage.filter { !localRawDatabase.contains(it) }
 
             for (handlerId in handlerCleanFromRaw) {
                 if (localRawDatabase.contains(handlerId)) continue
-                val getObjectInfoCommand = handlerCommandRetry(internalSession, executor) {
-                    GetObjectInfoCommand(
-                        internalSession,
-                        handlerId
-                    )
-                }
+                val getObjectInfoCommand = handlerCommandRetry(internalSession, executor) { GetObjectInfoCommand(internalSession, handlerId) }
                 val objectInfo = getObjectInfoCommand.getResult().getOrNull() ?: continue
                 val filename = objectInfo.filename?.uppercase() ?: ""
 
@@ -427,17 +487,10 @@ class CanonCamera(private val session: Session) : BaseCamera() {
                     val exifData = extractExifSignaturePartial(objectImage)
                     val enrichedImage = objectImage.copy(exifKey = exifData)
                     val objectInfoWithExif = ObjectImageWithExif(objectInfo, exifData)
-                    if (exifData != null && exifData.isNotEmpty() && localExifDatabaseExist.contains(
-                            exifData
-                        )
-                    ) continue
-                    val isExist =
-                        listenerCamera?.onIsImageAlreadyInDatabase(objectInfoWithExif, skipAutoUpload)
-                            ?: false
+                    if (exifData != null && exifData.isNotEmpty() && localExifDatabaseExist.contains(exifData)) continue
+                    val isExist = listenerCamera?.onIsImageAlreadyInDatabase(objectInfoWithExif, skipAutoUpload) ?: false
                     if (isExist) {
-                        if (exifData.isNullOrEmpty()) localExifDatabaseNotFound.add(dedupKey) else localExifDatabaseExist.add(
-                            exifData
-                        )
+                        if (exifData.isNullOrEmpty()) localExifDatabaseNotFound.add(dedupKey) else localExifDatabaseExist.add(exifData)
                     } else {
                         consumeImage(enrichedImage)
                     }
