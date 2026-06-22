@@ -50,7 +50,6 @@ class CanonCamera(private val session: Session) : BaseCamera() {
     private val localExifDatabaseExist = mutableSetOf<String>()
     private val localExifDatabaseNotFound = mutableSetOf<String>()
     private var isSkipAutoUpload = true
-    private var hasUnfinishedFiles = false
 
     override fun execute(executor: WorkerExecutor) = runBlocking {
         val deviceInfo = onConnecting(executor)
