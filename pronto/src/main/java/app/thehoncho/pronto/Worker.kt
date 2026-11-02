@@ -128,7 +128,7 @@ class Worker(
         val outLen = b.size
 
         // Send command to device
-        logger.d(TAG, "Sending packet")
+        logger.v(TAG, "Sending packet")
 
         val res = connection.transferOut(b, outLen, TIMEOUT)
         if (res < outLen) {
@@ -140,10 +140,10 @@ class Worker(
             stop()
             return
         }
-        logger.d(TAG, "Sending packet done with data size $res")
+        logger.v(TAG, "Sending packet done with data size $res")
         // Log.d(TAG, PacketUtil.hexDumpToString(b.array(), 0, res))
 
-        logger.d(TAG, "Reading packet")
+        logger.v(TAG, "Reading packet")
         while (!command.hasResponseReceived) {
             val maxPacketSize: Int = connection.maxPacketInSize
             val inputBytes = requireNotNull(smallIn) { "smallIn is null" }
@@ -158,7 +158,7 @@ class Worker(
                 logger.w(TAG, "handleCommand: read is 0, lets try to request again")
                 continue
             } else {
-                logger.d(TAG, String.format("Packet found with size %d", read))
+                logger.v(TAG, String.format("Packet found with size %d", read))
             }
             // Log.d(TAG, PacketUtil.hexDumpToString(inputBytes.duplicate().array(), 0, read))
             if (read < 12) {
@@ -175,7 +175,7 @@ class Worker(
             }
             val length = inputBytes.int
             val type = inputBytes.short
-            logger.d(TAG,
+            logger.v(TAG,
                 String.format(
                     "Fist income packet found with read %d length %d and type %s",
                     read,
@@ -186,7 +186,7 @@ class Worker(
             if (type == PtpConstants.Type.Event && length == 16) {
                 // We should send to events and start request again this usually not to much data
                 // just need read one no need loop but need to fix it later to handle huge
-                logger.d(TAG, "[EVENT] Try to send byte to command for parse")
+                logger.v(TAG, "[EVENT] Try to send byte to command for parse")
 
                 if (read == length) {
                     // event capture send to command
@@ -201,23 +201,23 @@ class Worker(
             } else if (type == PtpConstants.Type.Data) {
                 // This start data so we need to request in looping
                 // we need to use loop in here to request with multiple
-                logger.d(TAG, "[DATA] Try to send byte to read parallel, this is data type")
+                logger.v(TAG, "[DATA] Try to send byte to read parallel, this is data type")
 
                 inputBytes.position(0)
 
-                logger.d(TAG, "[DATA] Start read data parallel")
+                logger.v(TAG, "[DATA] Start read data parallel")
 
                 val destination = ByteBuffer.allocate(length)
                 readDataParallel(inputBytes.array(), read, destination, length)
 
-                logger.d(TAG, "[DATA] Success read data parallel, send to command")
+                logger.v(TAG, "[DATA] Success read data parallel, send to command")
 
                 command.receivedRead(destination)
             } else if (type == PtpConstants.Type.Response && (length == 12 || length == 16 || length == 20)) {
                 // This is end of data so we need to stop
                 // length = 16 its for Nikon
                 // length = 20 its for Canon Latest device
-                logger.d(TAG, "[RESPONSE] $length Try to send byte to command for parse")
+                logger.v(TAG, "[RESPONSE] $length Try to send byte to command for parse")
 
                 if (read == length) {
                     val sender = ByteBuffer.allocate(length)
@@ -226,7 +226,7 @@ class Worker(
 
                     command.receivedRead(sender)
 
-                    logger.d(TAG, "[RESPONSE] $length Success send byte to command for parse, command success")
+                    logger.v(TAG, "[RESPONSE] $length Success send byte to command for parse, command success")
                 } else {
                     logger.e(TAG, "[RESPONSE] $length message not same as read length")
                 }
@@ -273,7 +273,7 @@ class Worker(
         destination.order(ByteOrder.LITTLE_ENDIAN)
         destination.position(0)
 
-        logger.d(TAG, String.format("readDataParallel with destination size %d", destinationLength))
+        logger.v(TAG, String.format("readDataParallel with destination size %d", destinationLength))
 
         // we put first byte from usb
         destination.put(headerByte, 0, headerByteSize)
@@ -301,7 +301,7 @@ class Worker(
             val byteC = ByteBuffer.allocate(sizeC)
             byteC.order(ByteOrder.LITTLE_ENDIAN)
 
-            logger.d(
+            logger.v(
                 TAG,
                 String.format("readDataParallel Current size A %d, B %d, C %d", sizeA, sizeB, sizeC)
             )
@@ -342,7 +342,7 @@ class Worker(
                 destination.put(sender)
                 totalBytes += sizeA
 
-                logger.d(
+                logger.v(
                     TAG,
                     String.format(
                         "readDataParallel Total bytes read from A %d and destination size %d with totalBytes %d position %d",
@@ -361,7 +361,7 @@ class Worker(
                 destination.put(sender)
                 totalBytes += sizeB
 
-                logger.d(
+                logger.v(
                     TAG,
                     String.format(
                         "readDataParallel Total bytes read from B %d and destination size %d with totalBytes %d position %d",
@@ -380,7 +380,7 @@ class Worker(
                 destination.put(sender)
                 totalBytes += sizeC
 
-                logger.d(
+                logger.v(
                     TAG,
                     String.format(
                         "readDataParallel Total bytes read from C %d and destination size %d with totalBytes %d position %d",
@@ -400,7 +400,7 @@ class Worker(
 //            )
 //        }
 
-        logger.d(
+        logger.v(
             TAG,
             String.format(
                 "readDataParallel Success read data parallel with totalBytes %d and destination size %d",

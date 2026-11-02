@@ -1,28 +1,24 @@
 package app.thehoncho.pronto.command.general
 
 import android.graphics.BitmapFactory
-import android.util.Log
 import app.thehoncho.pronto.Session
 import app.thehoncho.pronto.command.Command
 import app.thehoncho.pronto.model.ImageObject
 import app.thehoncho.pronto.utils.PtpConstants
+import java.io.File
 import java.nio.ByteBuffer
 
 class GetObjectCommand(
     session: Session,
     private val objectHandler: Int,
     private val sampleSize: Int = 2
-): Command(session) {
+) : Command(session) {
     private var options: BitmapFactory.Options = BitmapFactory.Options()
     private var content: ImageObject? = null
     private var throwable: Throwable? = null
 
     init {
-        if (sampleSize in 1..4) {
-            options.inSampleSize = sampleSize
-        } else {
-            options.inSampleSize = 2
-        }
+        options.inSampleSize = if (sampleSize in 1..4) sampleSize else 2
     }
 
     fun getResult(): Result<ImageObject> {
@@ -44,12 +40,16 @@ class GetObjectCommand(
     override fun decodeData(b: ByteBuffer, length: Int) {
         try {
             b.position(12)
-
-            // This make ByteBuffer clone, so we can use it in decodeResponse
             val bytes = ByteArray(length - 12)
             b[bytes, 0, length - 12]
-            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-            content = ImageObject(bytes, bitmap)
+
+            // ✅ Write to temp file (consistent with chunked downloads)
+            val tempFile = File.createTempFile("pronto_getobj_${objectHandler}_", ".tmp")
+            tempFile.writeBytes(bytes)
+
+            // ✅ Decode bitmap directly from file (no extra ByteArray copy)
+            val bitmap = BitmapFactory.decodeFile(tempFile.absolutePath, options)
+            content = ImageObject(tempFile, bitmap)
         } catch (throwable: Throwable) {
             this.throwable = throwable
         }

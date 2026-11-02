@@ -55,7 +55,7 @@ abstract class Command(protected val session: Session): PTPAction {
             PtpConstants.codeToString(type, code),
             tx
         )
-        session.log.d(TAG, logMessage)
+        session.log.v(TAG, logMessage)
 
         when (type) {
             PtpConstants.Type.Data -> {
